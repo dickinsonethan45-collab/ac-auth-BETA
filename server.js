@@ -1026,6 +1026,13 @@ html::-webkit-scrollbar-thumb{background:rgba(127,214,255,0.15);border-radius:3p
 html::-webkit-scrollbar-thumb:hover{background:rgba(127,214,255,0.3)}
 #bg{position:fixed;inset:0;z-index:0;pointer-events:none}
 
+/* Ambient glow orbs */
+.amb-orb{position:fixed;border-radius:50%;pointer-events:none;z-index:0;filter:blur(100px);animation:orbDrift 20s ease-in-out infinite alternate}
+.amb-1{width:500px;height:500px;background:rgba(127,214,255,0.05);top:-15%;left:-8%;animation-duration:22s}
+.amb-2{width:400px;height:400px;background:rgba(61,159,219,0.04);bottom:-12%;right:-6%;animation-delay:-6s;animation-duration:18s}
+.amb-3{width:300px;height:300px;background:rgba(127,214,255,0.03);top:40%;left:50%;animation-delay:-10s;animation-duration:25s}
+@keyframes orbDrift{0%{transform:translate(0,0) scale(1)}33%{transform:translate(50px,-40px) scale(1.1)}66%{transform:translate(-30px,50px) scale(.9)}100%{transform:translate(40px,20px) scale(1.05)}}
+
 .page{position:relative;z-index:1;max-width:1280px;margin:0 auto;padding-bottom:100px;min-height:100vh}
 
 /* Header */
@@ -1035,7 +1042,8 @@ html::-webkit-scrollbar-thumb:hover{background:rgba(127,214,255,0.3)}
 @keyframes logopulse{0%,100%{box-shadow:0 0 20px rgba(127,214,255,0.4)}50%{box-shadow:0 0 35px rgba(127,214,255,0.7),0 0 50px rgba(61,159,219,0.25)}}
 .hdr-name{font-size:17px;font-weight:700;font-family:'Space Grotesk',sans-serif;color:#fff;letter-spacing:-.5px}
 .hdr-name em{font-style:normal;background:linear-gradient(90deg,var(--pp),var(--pk));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.hdr-tag{font-size:8px;font-weight:800;letter-spacing:3px;text-transform:uppercase;background:var(--pp-dim);border:1px solid rgba(127,214,255,0.2);color:var(--pp);border-radius:100px;padding:3px 11px;margin-left:4px}
+.hdr-tag{font-size:8px;font-weight:800;letter-spacing:3px;text-transform:uppercase;background:var(--pp-dim);border:1px solid rgba(127,214,255,0.2);color:var(--pp);border-radius:100px;padding:3px 11px;margin-left:4px;animation:tagPulse 3s ease-in-out infinite}
+@keyframes tagPulse{0%,100%{box-shadow:0 0 0 rgba(127,214,255,0)}50%{box-shadow:0 0 12px rgba(127,214,255,0.15)}}
 .made-by{display:flex;align-items:center;gap:7px;background:linear-gradient(135deg,rgba(127,214,255,0.12),rgba(61,159,219,0.08));border:1px solid rgba(127,214,255,0.3);border-radius:100px;padding:4px 13px 4px 9px;position:relative;overflow:hidden}
 .made-by::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(127,214,255,0.06),transparent);animation:shimmer 2.5s linear infinite}
 @keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
@@ -1048,16 +1056,20 @@ html::-webkit-scrollbar-thumb:hover{background:rgba(127,214,255,0.3)}
 .hnav-btn:hover{color:var(--text);background:rgba(255,255,255,0.06)}
 .hnav-active{background:linear-gradient(135deg,var(--pp),var(--pk))!important;color:#fff!important;box-shadow:0 2px 12px rgba(127,214,255,0.4)}
 .hdr-r{margin-left:auto;display:flex;align-items:center;gap:10px}
-.hdr-clock{font-size:12px;color:var(--muted);font-family:var(--mono);background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;padding:6px 12px}
+.hdr-clock{font-size:12px;color:var(--muted);font-family:var(--mono);background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;padding:6px 12px;letter-spacing:1px}
 
 /* Stats */
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:24px 32px 0}
 .stat{background:linear-gradient(135deg,rgba(127,214,255,0.04),rgba(61,159,219,0.02));border:1px solid rgba(127,214,255,0.1);border-radius:20px;padding:26px 28px;position:relative;overflow:hidden;transition:all .3s cubic-bezier(.16,1,.3,1)}
 .stat:hover{border-color:rgba(127,214,255,0.3);transform:translateY(-3px);box-shadow:0 12px 40px rgba(0,0,0,0.3),0 0 30px rgba(127,214,255,0.06)}
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--pp),var(--pk),transparent);opacity:.6}
-.stat::after{content:'';position:absolute;top:-40px;right:-40px;width:120px;height:120px;background:radial-gradient(circle,rgba(127,214,255,0.06) 0%,transparent 70%);pointer-events:none}
+.stat::after{content:'';position:absolute;top:-40px;right:-40px;width:120px;height:120px;background:radial-gradient(circle,rgba(127,214,255,0.06) 0%,transparent 70%);pointer-events:none;transition:all .3s}
+.stat:hover::after{transform:scale(1.5);opacity:.8}
 .stat-lbl{font-size:9px;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
 .stat-val{font-size:44px;font-weight:900;background:linear-gradient(135deg,var(--pp),var(--pk));-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1;font-variant-numeric:tabular-nums;font-family:'Space Grotesk',sans-serif}
+.stat:nth-child(1) .stat-val{background:linear-gradient(135deg,#7fd6ff,#3d9fdb);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.stat:nth-child(2) .stat-val{background:linear-gradient(135deg,#4ade80,#22c55e);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.stat:nth-child(3) .stat-val{background:linear-gradient(135deg,#c084fc,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 
 /* Toolbar */
 .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:20px 32px 4px}
@@ -1089,10 +1101,21 @@ html::-webkit-scrollbar-thumb:hover{background:rgba(127,214,255,0.3)}
 
 /* Cards */
 #cards{padding:0 32px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.card{border-radius:20px;overflow:hidden;border:1px solid var(--border);background:rgba(8,4,18,0.7);backdrop-filter:blur(16px);transition:all .3s cubic-bezier(.16,1,.3,1);position:relative}
+.card{border-radius:20px;overflow:hidden;border:1px solid var(--border);background:rgba(8,4,18,0.7);backdrop-filter:blur(16px);transition:all .3s cubic-bezier(.16,1,.3,1);position:relative;animation:cardIn .6s cubic-bezier(.16,1,.3,1) both}
+.card:nth-child(1){animation-delay:.05s}
+.card:nth-child(2){animation-delay:.1s}
+.card:nth-child(3){animation-delay:.15s}
+.card:nth-child(4){animation-delay:.2s}
+.card:nth-child(5){animation-delay:.25s}
+.card:nth-child(6){animation-delay:.3s}
+.card:nth-child(7){animation-delay:.35s}
+.card:nth-child(8){animation-delay:.4s}
+@keyframes cardIn{from{opacity:0;transform:translateY(20px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;z-index:1;background:linear-gradient(90deg,transparent 5%,var(--pp) 50%,transparent 95%);opacity:0;transition:opacity .3s}
+.card::after{content:'';position:absolute;inset:0;border-radius:20px;opacity:0;transition:opacity .3s;pointer-events:none;background:radial-gradient(600px circle at var(--mx,50%) var(--my,50%),rgba(127,214,255,0.04),transparent 40%)}
 .card:hover{border-color:rgba(127,214,255,0.2);box-shadow:0 16px 60px rgba(0,0,0,0.4),0 0 40px rgba(127,214,255,0.04);transform:translateY(-2px)}
 .card:hover::before{opacity:1}
+.card:hover::after{opacity:1}
 .card-head{display:flex;align-items:center;gap:10px;padding:18px 22px;border-bottom:1px solid rgba(255,255,255,0.04);background:linear-gradient(135deg,rgba(127,214,255,0.03),rgba(61,159,219,0.015))}
 .card-status{display:flex;align-items:center;gap:7px;font-size:9px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;padding:4px 11px;border-radius:100px;flex-shrink:0}
 .cs-on{color:var(--pp);background:rgba(127,214,255,0.1);border:1px solid rgba(127,214,255,0.2)}
@@ -1172,15 +1195,17 @@ html::-webkit-scrollbar-thumb:hover{background:rgba(127,214,255,0.3)}
 
 /* Floating Action Button */
 .fab-wrap{position:fixed;bottom:32px;right:32px;z-index:200}
-.fab{width:56px;height:56px;border-radius:16px;border:none;background:linear-gradient(135deg,var(--pp),var(--pk));color:#04101f;font-size:24px;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 32px rgba(127,214,255,0.4);transition:all .3s cubic-bezier(.16,1,.3,1);font-weight:300}
+.fab{width:56px;height:56px;border-radius:16px;border:none;background:linear-gradient(135deg,var(--pp),var(--pk));color:#04101f;font-size:24px;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 32px rgba(127,214,255,0.4);transition:all .3s cubic-bezier(.16,1,.3,1);font-weight:300;position:relative;z-index:2}
+.fab::before{content:'';position:absolute;inset:-3px;border-radius:19px;background:linear-gradient(135deg,var(--pp),var(--pk));opacity:0;transition:opacity .3s;z-index:-1;filter:blur(8px)}
 .fab:hover{transform:scale(1.08);box-shadow:0 12px 40px rgba(127,214,255,0.55)}
+.fab:hover::before{opacity:.5}
 .fab.open{transform:rotate(45deg)}
 .fab-menu{position:absolute;bottom:68px;right:0;display:flex;flex-direction:column;gap:8px;opacity:0;transform:translateY(10px) scale(.95);pointer-events:none;transition:all .25s cubic-bezier(.16,1,.3,1)}
 .fab-menu.open{opacity:1;transform:translateY(0) scale(1);pointer-events:auto}
-.fab-item{display:flex;align-items:center;gap:10px;white-space:nowrap;background:rgba(6,12,28,0.92);backdrop-filter:blur(20px);border:1px solid rgba(127,214,255,0.12);border-radius:12px;padding:10px 18px;font-size:12px;font-weight:700;color:var(--pp);cursor:pointer;transition:all .15s;font-family:'Inter',sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.4);justify-content:flex-end}
-.fab-item:hover{background:var(--pp-dim);border-color:rgba(127,214,255,0.3);transform:translateX(-4px)}
+.fab-item{display:flex;align-items:center;gap:10px;white-space:nowrap;background:rgba(6,12,28,0.92)!important;backdrop-filter:blur(20px);border:1px solid rgba(127,214,255,0.12);border-radius:12px;padding:10px 18px;font-size:12px;font-weight:700;color:var(--pp);cursor:pointer;transition:all .15s;font-family:'Inter',sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.4);justify-content:flex-end;text-decoration:none}
+.fab-item:hover{background:var(--pp-dim)!important;border-color:rgba(127,214,255,0.3);transform:translateX(-4px)}
 .fab-item form{display:inline;margin:0;padding:0;background:none;border:none}
-.fab-item button{background:none;border:none;color:inherit;font:inherit;cursor:pointer;padding:0;display:flex;align-items:center;gap:10px}
+.fab-item button{background:none!important;border:none!important;color:inherit;font:inherit;cursor:pointer;padding:0;display:flex;align-items:center;gap:10px}
 .fab-icon{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
 .fi-purple{background:rgba(127,214,255,0.1);border:1px solid rgba(127,214,255,0.15)}
 .fi-orange{background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.15)}
@@ -1194,6 +1219,9 @@ html::-webkit-scrollbar-thumb:hover{background:rgba(127,214,255,0.3)}
 @media(max-width:700px){.stats{grid-template-columns:1fr}.made-by{display:none}.search{width:100%}.hdr{padding:12px 16px}.stats,.bar,.cpanel,#cards{padding-left:16px;padding-right:16px}}
 </style></head><body>
 <canvas id="bg"></canvas>
+<div class="amb-orb amb-1"></div>
+<div class="amb-orb amb-2"></div>
+<div class="amb-orb amb-3"></div>
 <div class="page">
 
 <div class="hdr">
@@ -1238,14 +1266,14 @@ html::-webkit-scrollbar-thumb:hover{background:rgba(127,214,255,0.3)}
 </div>
 <div class="toast" id="toast"></div>
 
-<div class="fab-wrap">
+<div class="fab-wrap" id="fabWrap">
   <div class="fab-menu" id="fabMenu">
-    <div class="fab-item" onclick="toggleCreate()"><span class="fab-icon fi-purple">+</span>New Session</div>
-    <div class="fab-item"><form method="POST" action="/refresh-all"><button type="submit"><span class="fab-icon fi-orange">&#x21bb;</span>Refresh All</button></form></div>
-    <div class="fab-item"><form method="POST" action="/clean-duplicates"><button type="submit"><span class="fab-icon fi-ghost">&#x2715;</span>Clean Dupes</button></form></div>
+    <div class="fab-item" onclick="toggleCreate();closeFab()"><span class="fab-icon fi-purple">+</span>New Session</div>
+    <form method="POST" action="/refresh-all"><button type="submit" class="fab-item"><span class="fab-icon fi-orange">&#x21bb;</span>Refresh All</button></form>
+    <form method="POST" action="/clean-duplicates"><button type="submit" class="fab-item"><span class="fab-icon fi-ghost">&#x2715;</span>Clean Dupes</button></form>
     <div class="fab-item" id="blurBtn" onclick="toggleBlur()"><span class="fab-icon fi-ghost">&#x1f512;</span>Hide Tokens</div>
   </div>
-  <button class="fab" id="fabBtn" onclick="toggleFab()">+</button>
+  <button type="button" class="fab" id="fabBtn" onclick="toggleFab()">+</button>
 </div>
 
 <script>
@@ -1256,6 +1284,32 @@ function toggleFab(){
   document.getElementById('fabMenu').classList.toggle('open',fabOpen);
   document.getElementById('fabBtn').classList.toggle('open',fabOpen);
 }
+function closeFab(){
+  fabOpen=false;
+  document.getElementById('fabMenu').classList.remove('open');
+  document.getElementById('fabBtn').classList.remove('open');
+}
+document.addEventListener('click',function(e){
+  if(fabOpen&&!document.getElementById('fabWrap').contains(e.target))closeFab();
+});
+document.querySelectorAll('.card').forEach(c=>{
+  c.addEventListener('mousemove',function(e){
+    const r=this.getBoundingClientRect();
+    this.style.setProperty('--mx',(e.clientX-r.left)+'px');
+    this.style.setProperty('--my',(e.clientY-r.top)+'px');
+  });
+});
+document.querySelectorAll('.stat-val').forEach(el=>{
+  const target=parseInt(el.textContent)||0;
+  if(target===0)return;
+  let current=0;
+  const step=Math.max(1,Math.ceil(target/30));
+  const timer=setInterval(()=>{
+    current=Math.min(current+step,target);
+    el.textContent=current;
+    if(current>=target)clearInterval(timer);
+  },30);
+});
 function toggleBlur(){
   blurred=!blurred;
   document.querySelectorAll('.tok-v,.hideable').forEach(e=>e.classList.toggle('blurred',blurred));
