@@ -371,7 +371,7 @@ function handlePresenceBatch(session, state, presences, isLive) {
     const name = (u && (u.display_name || u.username)) || uid;
     const prev = roomCache[uid];
     const changed = !prev || prev.roomCode !== parsed.roomCode;
-    roomCache[uid] = { roomCode: parsed.roomCode, gameMode: parsed.gameMode, lastSeenOnline: Date.now(), name };
+    roomCache[uid] = { roomCode: parsed.roomCode, gameMode: parsed.gameMode, firstSeenOnline: prev?.firstSeenOnline || Date.now(), lastSeenOnline: Date.now(), name };
     dirty = true;
     if (isLive && state.warm && changed) {
       sendRoomJoinWebhook({
@@ -1284,7 +1284,7 @@ app.get("/session/:id/friends",async(req,res)=>{
       if(uid&&liveRoomCode){
         const prev=roomCache[uid];
         const isNewJoin=!!prev&&prev.roomCode!==liveRoomCode;
-        roomCache[uid]={roomCode:liveRoomCode,gameMode:pres.gameMode,lastSeenOnline:Date.now(),name};
+        roomCache[uid]={roomCode:liveRoomCode,gameMode:pres.gameMode,firstSeenOnline:prev?.firstSeenOnline||Date.now(),lastSeenOnline:Date.now(),name};
         cacheDirty=true;
         if(isNewJoin){
           pendingWebhooks.push({
@@ -1334,14 +1334,16 @@ app.get("/try-refresh",async(req,res)=>{
 // ── ROOM LOOKUP API ──────────────────────────────────────────────────────────
 app.get("/api/room-cache", (req, res) => {
   const code = (req.query.code || "").trim().toLowerCase();
-  if (!code) return res.json({ results: [] });
-  const results = [];
+  if (!code) return res.json({ owner: null });
+  let owner = null;
   for (const [uid, info] of Object.entries(roomCache)) {
     if (info.roomCode && info.roomCode.toLowerCase() === code) {
-      results.push({ userId: uid, name: info.name || uid, roomCode: info.roomCode, gameMode: info.gameMode, lastSeenOnline: info.lastSeenOnline });
+      if (!owner || (info.firstSeenOnline || info.lastSeenOnline) < (owner.firstSeenOnline || owner.lastSeenOnline)) {
+        owner = { userId: uid, name: info.name || uid, roomCode: info.roomCode, gameMode: info.gameMode, firstSeenOnline: info.firstSeenOnline || info.lastSeenOnline, lastSeenOnline: info.lastSeenOnline };
+      }
     }
   }
-  res.json({ results });
+  res.json({ owner });
 });
 
 // ── ROOM LOOKUP PAGE ─────────────────────────────────────────────────────────
@@ -1454,7 +1456,7 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 
 <div class="rl-wrap">
   <div class="rl-title">Room Lookup</div>
-  <div class="rl-sub">Enter a room code to find who owns it and their user ID</div>
+  <div class="rl-sub">Enter a room code to find the owner and their user ID</div>
 
   <div class="search-box">
     <input class="search-input" type="text" id="roomInput" placeholder="Enter room code..." autocomplete="off" autofocus>
@@ -1492,33 +1494,33 @@ async function doSearch(){
   try{
     const r=await fetch('/api/room-cache?code='+encodeURIComponent(code));
     const data=await r.json();
-    const items=data.results||[];
-    if(!items.length){
-      status.className='rl-status';status.textContent='No players found in room "'+code+'"';
-      results.innerHTML='<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-text">No results</div><div class="empty-hint">No tracked players are currently in this room</div></div>';
+    const p=data.owner;
+    if(!p){
+      status.className='rl-status';status.textContent='No owner found for room "'+code+'"';
+      results.innerHTML='<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-text">No results</div><div class="empty-hint">No tracked player has been detected as owner of this room</div></div>';
       return;
     }
-    status.className='rl-status ok';status.textContent='Found '+items.length+' player'+(items.length===1?'':'s')+' in room "'+code+'"';
-    results.innerHTML=items.map(p=>{
-      const gm=p.gameMode;
-      const gmLabel=GM[gm]||'Unknown';
-      const gmEmoji=GM_EMOJI[gm]||'🎮';
-      const gmCls=GM_CLS[gm]||'mode-unknown';
-      const ago=p.lastSeenOnline?timeAgo(p.lastSeenOnline):'';
-      return '<div class="result-card">'
-        +'<div class="result-avatar">👤</div>'
-        +'<div class="result-info">'
-          +'<div class="result-name">'+escHtml(p.name||p.userId)+'</div>'
-          +'<div class="result-grid">'
-            +'<div class="result-field"><span class="result-label">User ID</span><span class="result-value id-val" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')" title="Click to copy">'+p.userId+'</span></div>'
-            +'<div class="result-field"><span class="result-label">Room</span><span class="result-value">'+escHtml(p.roomCode)+'</span></div>'
-            +'<div class="result-field"><span class="result-label">Last Seen</span><span class="result-value">'+ago+'</span></div>'
-          +'</div>'
-          +'<div class="result-modes"><span class="mode-tag '+gmCls+'">'+gmEmoji+' '+gmLabel+'</span></div>'
+    status.className='rl-status ok';status.textContent='Room owner found!';
+    const gm=p.gameMode;
+    const gmLabel=GM[gm]||'Unknown';
+    const gmEmoji=GM_EMOJI[gm]||'🎮';
+    const gmCls=GM_CLS[gm]||'mode-unknown';
+    const createdAgo=p.firstSeenOnline?timeAgo(p.firstSeenOnline):'';
+    const seenAgo=p.lastSeenOnline?timeAgo(p.lastSeenOnline):'';
+    results.innerHTML='<div class="result-card">'
+      +'<div class="result-avatar">👑</div>'
+      +'<div class="result-info">'
+        +'<div class="result-name">'+escHtml(p.name||p.userId)+'</div>'
+        +'<div class="result-grid">'
+          +'<div class="result-field"><span class="result-label">User ID</span><span class="result-value id-val" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')" title="Click to copy">'+p.userId+'</span></div>'
+          +'<div class="result-field"><span class="result-label">Room Code</span><span class="result-value">'+escHtml(p.roomCode)+'</span></div>'
+          +'<div class="result-field"><span class="result-label">First Seen</span><span class="result-value">'+createdAgo+'</span></div>'
+          +'<div class="result-field"><span class="result-label">Last Seen</span><span class="result-value">'+seenAgo+'</span></div>'
         +'</div>'
-        +'<button class="result-copy" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')">📋 Copy ID</button>'
-      +'</div>';
-    }).join('');
+        +'<div class="result-modes"><span class="mode-tag '+gmCls+'">'+gmEmoji+' '+gmLabel+'</span></div>'
+      +'</div>'
+      +'<button class="result-copy" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')">📋 Copy ID</button>'
+    +'</div>';
   }catch(e){
     status.className='rl-status err';status.textContent='Search failed: '+e.message;
   }
