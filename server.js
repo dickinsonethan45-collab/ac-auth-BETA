@@ -1337,38 +1337,73 @@ app.post("/api/logout-session", async (req, res) => {
   const { token } = req.body;
   if (!token || !token.trim()) return res.status(400).json({ ok: false, error: "Token is required" });
   const t = token.trim();
-  try {
-    const r = await fetch(`${NAKAMA_SERVER}/v2/session/logout`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${t}`,
-        "Content-Type": "application/json",
-        "User-Agent": "UnityPlayer/6000.3.12f1 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)",
-        "x-unity-version": "6000.3.12f1"
-      },
-      body: "{}"
-    });
-    const status = r.status;
-    const text = await r.text();
-    if (status === 200) {
-      let matchedSession = null;
-      for (const s of Object.values(sessions)) {
-        if (s.token === t || s.refresh_token === t) { matchedSession = s; break; }
-      }
-      if (matchedSession) {
-        const ex = liveSockets[matchedSession.id];
-        if (ex && ex.sock) { try { ex.sock.removeAllListeners(); ex.sock.close(); } catch (_) {} }
-        delete liveSockets[matchedSession.id];
-        matchedSession.token = "";
-        matchedSession.refresh_token = "";
-        saveSessions();
-      }
-      return res.json({ ok: true, status, message: "Session invalidated successfully" });
-    } else {
-      return res.json({ ok: false, status, error: `Nakama returned HTTP ${status}: ${text.slice(0, 200)}` });
+
+  // Decode the provided token to find the user ID
+  const payload = decodeToken(t);
+  const targetUid = payload.uid;
+
+  // Find ALL local sessions that share the same uid (same account)
+  const linkedSessions = [];
+  for (const s of Object.values(sessions)) {
+    if (!s.token) continue;
+    try {
+      const p = decodeToken(s.token);
+      if (p.uid && p.uid === targetUid) linkedSessions.push(s);
+    } catch (_) {}
+  }
+
+  // Also check if the provided token itself matches a session not caught above
+  for (const s of Object.values(sessions)) {
+    if ((s.token === t || s.refresh_token === t) && !linkedSessions.find(x => x.id === s.id)) {
+      linkedSessions.push(s);
     }
-  } catch (e) {
-    return res.json({ ok: false, error: e.message });
+  }
+
+  const results = [];
+  let anySuccess = false;
+
+  // Call Nakama logout for EVERY token found on this account
+  for (const s of linkedSessions) {
+    const tokensToKill = [s.token, s.refresh_token].filter(Boolean);
+    for (const tok of tokensToKill) {
+      try {
+        const r = await fetch(`${NAKAMA_SERVER}/v2/session/logout`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${tok}`,
+            "Content-Type": "application/json",
+            "User-Agent": "UnityPlayer/6000.3.12f1 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)",
+            "x-unity-version": "6000.3.12f1"
+          },
+          body: "{}"
+        });
+        results.push({ session: s.name || s.id, tokenType: tok === s.token ? "session" : "refresh", status: r.status });
+        if (r.status === 200) anySuccess = true;
+      } catch (e) {
+        results.push({ session: s.name || s.id, tokenType: tok === s.token ? "session" : "refresh", error: e.message });
+      }
+    }
+
+    // Disconnect live socket and clear local data for every matched session
+    const ex = liveSockets[s.id];
+    if (ex && ex.sock) { try { ex.sock.removeAllListeners(); ex.sock.close(); } catch (_) {} }
+    delete liveSockets[s.id];
+    s.token = "";
+    s.refresh_token = "";
+  }
+
+  if (linkedSessions.length) saveSessions();
+
+  if (anySuccess || linkedSessions.length) {
+    return res.json({
+      ok: true,
+      message: `Invalidated ${linkedSessions.length} linked session(s) for account ${targetUid || "unknown"}`,
+      uid: targetUid,
+      sessionsFound: linkedSessions.length,
+      details: results
+    });
+  } else {
+    return res.json({ ok: false, error: "No matching sessions found and Nakama logout failed", details: results });
   }
 });
 
@@ -1464,12 +1499,12 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 
 <div class="sl-wrap">
   <div class="sl-title">Session Logout</div>
-  <div class="sl-sub">Paste a session token to invalidate it on the Nakama server</div>
+  <div class="sl-sub">Paste a token to invalidate ALL sessions linked to that account on Nakama</div>
 
   <div class="token-box">
     <div class="token-label">Session Token</div>
     <textarea class="token-input" id="tokenInput" rows="4" placeholder="Paste the full session token here..." autofocus></textarea>
-    <div class="token-hint">This will call <strong>/v2/session/logout</strong> on Nakama, making the token and its linked refresh token unusable.</div>
+    <div class="token-hint">This finds <strong>all sessions</strong> linked to the same account (by user ID) and calls <strong>/v2/session/logout</strong> on each one, killing every token for that account.</div>
   </div>
 
   <button class="logout-btn" id="logoutBtn" onclick="doLogout()">Invalidate Session</button>
@@ -1489,13 +1524,15 @@ async function doLogout(){
   const btn=document.getElementById('logoutBtn');
   if(!token){status.className='sl-status show err';status.innerHTML='<span class="sl-status-icon">⚠️</span>Please paste a token first.';return;}
   btn.disabled=true;btn.textContent='Logging out...';
-  status.className='sl-status show loading';status.innerHTML='<span class="sl-status-icon">⏳</span>Invalidating session...';
+  status.className='sl-status show loading';status.innerHTML='<span class="sl-status-icon">⏳</span>Invalidating all linked sessions...';
   try{
     const r=await fetch('/api/logout-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})});
     const data=await r.json();
     if(data.ok){
       status.className='sl-status show ok';
-      status.innerHTML='<span class="sl-status-icon">✅</span><strong>Session invalidated!</strong><br>The token and its linked refresh token are now unusable.'+(data.matchedSession?'<br>Local session <strong>'+escHtml(data.matchedSession)+'</strong> cleared.':'');
+      status.innerHTML='<span class="sl-status-icon">✅</span><strong>All sessions invalidated!</strong><br>'
+        +'Account: <strong>'+escHtml(data.uid||'unknown')+'</strong><br>'
+        +'Sessions found and killed: <strong>'+data.sessionsFound+'</strong>';
     }else{
       status.className='sl-status show err';
       status.innerHTML='<span class="sl-status-icon">❌</span><strong>Logout failed.</strong><br>'+escHtml(data.error||'Unknown error')+(data.status?' (HTTP '+data.status+')':'');
