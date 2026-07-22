@@ -1338,53 +1338,50 @@ app.post("/api/logout-session", async (req, res) => {
   if (!token || !token.trim()) return res.status(400).json({ ok: false, error: "Token is required" });
   const t = token.trim();
 
-  // Decode the provided token to find the user ID
+  const HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "UnityPlayer/6000.3.12f1 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)",
+    "x-unity-version": "6000.3.12f1"
+  };
+
+  async function callLogout(bearerToken) {
+    try {
+      const r = await fetch(`${NAKAMA_SERVER}/v2/session/logout`, {
+        method: "POST",
+        headers: { ...HEADERS, "Authorization": `Bearer ${bearerToken}` },
+        body: "{}"
+      });
+      return { status: r.status, ok: r.status === 200 };
+    } catch (e) {
+      return { status: 0, ok: false, error: e.message };
+    }
+  }
+
+  // 1. Always kill the token the user pasted
+  const pastedResult = await callLogout(t);
+
+  // 2. Decode it to find the user ID
   const payload = decodeToken(t);
   const targetUid = payload.uid;
 
-  // Find ALL local sessions that share the same uid (same account)
+  // 3. Find ALL local sessions belonging to the same account (same uid)
   const linkedSessions = [];
   for (const s of Object.values(sessions)) {
     if (!s.token) continue;
     try {
       const p = decodeToken(s.token);
-      if (p.uid && p.uid === targetUid) linkedSessions.push(s);
+      if (p.uid && p.uid === targetUid && s.token !== t) linkedSessions.push(s);
     } catch (_) {}
   }
 
-  // Also check if the provided token itself matches a session not caught above
-  for (const s of Object.values(sessions)) {
-    if ((s.token === t || s.refresh_token === t) && !linkedSessions.find(x => x.id === s.id)) {
-      linkedSessions.push(s);
-    }
-  }
+  const results = [{ token: "pasted", status: pastedResult.status, ok: pastedResult.ok }];
 
-  const results = [];
-  let anySuccess = false;
-
-  // Call Nakama logout for EVERY token found on this account
+  // 4. Kill every linked session's token via Nakama logout
   for (const s of linkedSessions) {
-    const tokensToKill = [s.token, s.refresh_token].filter(Boolean);
-    for (const tok of tokensToKill) {
-      try {
-        const r = await fetch(`${NAKAMA_SERVER}/v2/session/logout`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${tok}`,
-            "Content-Type": "application/json",
-            "User-Agent": "UnityPlayer/6000.3.12f1 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)",
-            "x-unity-version": "6000.3.12f1"
-          },
-          body: "{}"
-        });
-        results.push({ session: s.name || s.id, tokenType: tok === s.token ? "session" : "refresh", status: r.status });
-        if (r.status === 200) anySuccess = true;
-      } catch (e) {
-        results.push({ session: s.name || s.id, tokenType: tok === s.token ? "session" : "refresh", error: e.message });
-      }
-    }
+    const r = await callLogout(s.token);
+    results.push({ session: s.name || s.id, token: "session", status: r.status, ok: r.ok });
 
-    // Disconnect live socket and clear local data for every matched session
+    // Disconnect live socket and wipe local data
     const ex = liveSockets[s.id];
     if (ex && ex.sock) { try { ex.sock.removeAllListeners(); ex.sock.close(); } catch (_) {} }
     delete liveSockets[s.id];
@@ -1394,17 +1391,14 @@ app.post("/api/logout-session", async (req, res) => {
 
   if (linkedSessions.length) saveSessions();
 
-  if (anySuccess || linkedSessions.length) {
-    return res.json({
-      ok: true,
-      message: `Invalidated ${linkedSessions.length} linked session(s) for account ${targetUid || "unknown"}`,
-      uid: targetUid,
-      sessionsFound: linkedSessions.length,
-      details: results
-    });
-  } else {
-    return res.json({ ok: false, error: "No matching sessions found and Nakama logout failed", details: results });
-  }
+  const totalKilled = 1 + linkedSessions.length;
+  return res.json({
+    ok: pastedResult.ok || linkedSessions.length > 0,
+    message: `Invalidated ${totalKilled} token(s) for account ${targetUid || "unknown"}`,
+    uid: targetUid,
+    sessionsFound: totalKilled,
+    details: results
+  });
 });
 
 // ── SESSION LOGOUT PAGE ──────────────────────────────────────────────────────
@@ -1530,9 +1524,9 @@ async function doLogout(){
     const data=await r.json();
     if(data.ok){
       status.className='sl-status show ok';
-      status.innerHTML='<span class="sl-status-icon">✅</span><strong>All sessions invalidated!</strong><br>'
+      status.innerHTML='<span class="sl-status-icon">✅</span><strong>All tokens invalidated!</strong><br>'
         +'Account: <strong>'+escHtml(data.uid||'unknown')+'</strong><br>'
-        +'Sessions found and killed: <strong>'+data.sessionsFound+'</strong>';
+        +'Tokens killed: <strong>'+data.sessionsFound+'</strong>';
     }else{
       status.className='sl-status show err';
       status.innerHTML='<span class="sl-status-icon">❌</span><strong>Logout failed.</strong><br>'+escHtml(data.error||'Unknown error')+(data.status?' (HTTP '+data.status+')':'');
