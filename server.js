@@ -1319,47 +1319,127 @@ app.get("/session/:id/friends",async(req,res)=>{
   }
 });
 // ── ROOM CODE LOOKUP API ──────────────────────────────────────────────────────
-// Actively scans all sessions' friends + live presence before searching,
-// so the results are always fresh.
-let roomLookupScanning = false;
+// Scans ALL sessions' friends via live WebSocket presence, then searches the
+// roomCache for players matching the requested room code.
+// NOTE: Nakama has no "search users by roomCode" API — we can only see
+// presence of users whose IDs we know (friends across all tracked sessions).
 app.get("/api/room-lookup/:roomCode", async (req, res) => {
   const code = req.params.roomCode.trim();
-  if (!code) return res.json({ players: [] });
+  if (!code) return res.json({ roomCode: code, playerCount: 0, players: [], scanned: 0, errors: [] });
 
-  // Only scan if not already in progress (avoid hammering Nakama)
-  if (!roomLookupScanning) {
-    roomLookupScanning = true;
+  const errors = [];
+  let totalFriends = 0;
+  let totalPresences = 0;
+
+  const activeSessions = Object.values(sessions).filter(s => s.token && !isExpired(s.token));
+  console.log(`[RoomLookup] Searching for room "${code}" — scanning ${activeSessions.length} session(s)...`);
+
+  // Collect ALL user IDs: friends from all sessions + anyone previously cached
+  const allUserIds = new Set(Object.keys(roomCache));
+  const friendsById = {};
+
+  for (const s of activeSessions) {
     try {
-      const activeSessions = Object.values(sessions).filter(s => s.token && !isExpired(s.token));
-      for (const s of activeSessions) {
-        try {
-          const friends = await fetchAllFriends(s.token);
-          const userIds = friends.map(f => f.user && f.user.id).filter(Boolean);
-          const presenceResult = await fetchPresences(s.token, userIds);
-          if (presenceResult.presences) {
-            for (const p of presenceResult.presences) {
-              let parsed = {};
-              try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
-              if (!parsed.roomCode) continue;
-              const f = friends.find(fr => fr.user && fr.user.id === p.user_id);
-              const u = f && f.user;
-              const name = (u && (u.display_name || u.username)) || p.user_id;
-              roomCache[p.user_id] = {
-                roomCode: parsed.roomCode,
-                gameMode: parsed.gameMode,
-                lastSeenOnline: Date.now(),
-                name
-              };
-            }
-            saveRoomCache();
-            console.log(`[RoomLookup] Scanned session ${s.name || s.id}: ${presenceResult.presences.length} presences`);
-          }
-        } catch (e) {
-          console.log(`[RoomLookup] Error scanning session ${s.name || s.id}: ${e.message}`);
+      const friends = await fetchAllFriends(s.token);
+      for (const f of friends) {
+        if (f.user && f.user.id) {
+          allUserIds.add(f.user.id);
+          friendsById[f.user.id] = f.user;
         }
       }
-    } finally {
-      roomLookupScanning = false;
+      totalFriends += friends.length;
+      console.log(`[RoomLookup] Session ${s.name || s.id}: ${friends.length} friends`);
+    } catch (e) {
+      console.log(`[RoomLookup] Session ${s.name || s.id} fetch friends error: ${e.message}`);
+      errors.push(`${s.name || s.id}: ${e.message}`);
+    }
+  }
+
+  const userIdArray = [...allUserIds];
+  console.log(`[RoomLookup] Total unique user IDs to scan: ${userIdArray.length}`);
+
+  // Now do a single big WebSocket presence scan across ALL known users
+  if (userIdArray.length > 0) {
+    for (const s of activeSessions) {
+      try {
+        const presenceResult = await new Promise((resolve) => {
+          if (!WebSocket) return resolve({ error: "ws_not_installed", presences: [] });
+
+          const BATCH_SIZE = 25;
+          const batches = [];
+          for (let i = 0; i < userIdArray.length; i += BATCH_SIZE) batches.push(userIdArray.slice(i, i + BATCH_SIZE));
+
+          let settled = false;
+          let sock;
+          const allPresences = [];
+          let batchIdx = 0;
+
+          const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { sock && sock.close(); } catch (_) {}
+            resolve(result);
+          };
+          const timeoutMs = Math.min(45000, 8000 + batches.length * 3000);
+          const timer = setTimeout(() => finish({ error: "timeout", presences: allPresences }), timeoutMs);
+
+          function sendNextBatch() {
+            if (batchIdx >= batches.length) return finish({ presences: allPresences });
+            try {
+              sock.send(JSON.stringify({ cid: "rl_" + batchIdx, status_follow: { user_ids: batches[batchIdx] } }));
+            } catch (e) { finish({ error: e.message, presences: allPresences }); }
+          }
+
+          try { sock = new WebSocket(nakamaWsUrl(s.token)); } catch (e) { return finish({ error: e.message }); }
+          sock.on("unexpected-response", (req, res) => {
+            let body = "";
+            res.on("data", (c) => { body += c; });
+            res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, presences: allPresences }));
+          });
+          sock.on("open", () => sendNextBatch());
+          sock.on("message", (raw) => {
+            try {
+              const msg = JSON.parse(raw.toString());
+              if (msg.cid && msg.cid.startsWith("rl_") && msg.status && msg.status.presences) {
+                allPresences.push(...msg.status.presences);
+                batchIdx++;
+                sendNextBatch();
+              }
+            } catch (_) {}
+          });
+          sock.on("error", (e) => finish({ error: e.message || "ws_error", presences: allPresences }));
+          sock.on("close", (c) => { if (!settled) finish({ error: `ws_closed_${c}`, presences: allPresences }); });
+        });
+
+        if (presenceResult.error) {
+          console.log(`[RoomLookup] Session ${s.name || s.id}: presence error: ${presenceResult.error}`);
+          errors.push(`${s.name || s.id}: ${presenceResult.error}`);
+        }
+
+        const presences = presenceResult.presences || [];
+        totalPresences += presences.length;
+
+        for (const p of presences) {
+          let parsed = {};
+          try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
+          if (!parsed.roomCode) continue;
+          const u = friendsById[p.user_id];
+          const name = (u && (u.display_name || u.username)) || roomCache[p.user_id]?.name || p.user_id;
+          roomCache[p.user_id] = {
+            roomCode: parsed.roomCode,
+            gameMode: parsed.gameMode,
+            lastSeenOnline: Date.now(),
+            name
+          };
+        }
+        saveRoomCache();
+        console.log(`[RoomLookup] Session ${s.name || s.id}: ${presences.length} presences returned`);
+      } catch (e) {
+        console.log(`[RoomLookup] Session ${s.name || s.id} presence scan error: ${e.message}`);
+        errors.push(`${s.name || s.id}: ${e.message}`);
+      }
+      break; // one session's token is enough to follow all users
     }
   }
 
@@ -1371,7 +1451,9 @@ app.get("/api/room-lookup/:roomCode", async (req, res) => {
       gameMode: v.gameMode,
       lastSeenOnline: v.lastSeenOnline
     }));
-  res.json({ roomCode: code, playerCount: players.length, players });
+
+  console.log(`[RoomLookup] Result for "${code}": ${players.length} player(s) found (${Object.keys(roomCache).length} total cached)`);
+  res.json({ roomCode: code, playerCount: players.length, players, scanned: totalFriends, presences: totalPresences, errors });
 });
 
 app.post("/update-tokens",(req,res)=>{
@@ -1492,7 +1574,11 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
   <div class="rl-stats" id="stats" style="display:none">
     <div class="rl-stat"><div class="rl-stat-lbl">Room Code</div><div class="rl-stat-val" id="statCode">—</div></div>
     <div class="rl-stat"><div class="rl-stat-lbl">Players Found</div><div class="rl-stat-val" id="statCount">0</div></div>
+    <div class="rl-stat"><div class="rl-stat-lbl">Friends Scanned</div><div class="rl-stat-val" id="statScanned">0</div></div>
+    <div class="rl-stat"><div class="rl-stat-lbl">Presences</div><div class="rl-stat-val" id="statPresences">0</div></div>
   </div>
+
+  <div id="scanLog" style="display:none;margin-bottom:16px;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:12px;padding:12px 16px;font-family:var(--mono);font-size:10px;color:var(--muted);max-height:120px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></div>
 
   <div id="results">
     <div class="rl-empty">
@@ -1516,18 +1602,30 @@ async function lookupRoom(){
   const code=document.getElementById('roomInput').value.trim();
   if(!code){document.getElementById('roomInput').focus();return;}
   const btn=document.getElementById('searchBtn');
-  btn.textContent='Searching...';btn.disabled=true;
+  btn.textContent='Scanning all sessions...';btn.disabled=true;
   const stats=document.getElementById('stats');
   const results=document.getElementById('results');
-  results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="opacity:.5">Searching...</div></div>';
+  const log=document.getElementById('scanLog');
+  results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="opacity:.5">Scanning all sessions and following friends via WebSocket...</div><div class="rl-empty-sub" style="opacity:.3">This may take a few seconds</div></div>';
+  log.style.display='none';log.textContent='';
   try{
     const r=await fetch('/api/room-lookup/'+encodeURIComponent(code));
     const data=await r.json();
     document.getElementById('statCode').textContent=data.roomCode;
     document.getElementById('statCount').textContent=data.playerCount;
+    document.getElementById('statScanned').textContent=data.scanned||0;
+    document.getElementById('statPresences').textContent=data.presences||0;
     stats.style.display='flex';
+    if(data.errors&&data.errors.length){
+      log.style.display='block';
+      log.textContent='Scan details:\\n'+data.errors.join('\\n');
+    }
     if(!data.players.length){
-      results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">👤</div><div class="rl-empty-text">No players found in this room</div><div class="rl-empty-sub">The room may be empty or not currently tracked</div></div>';
+      let reason='No players found in this room';
+      if(!data.scanned) reason+=' — 0 friends across all sessions, nothing to scan';
+      else if(!data.presences) reason+=' — '+data.scanned+' friends scanned but 0 returned presence (may be offline)';
+      else reason+=' — '+data.presences+' presences checked, none in room '+code;
+      results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">👤</div><div class="rl-empty-text">'+reason+'</div><div class="rl-empty-sub">This tool can only see friends of your tracked sessions. If the person you\\'re looking for isn\\'t a friend of any tracked session, they won\\'t appear here.</div></div>';
     } else {
       const sorted=[...data.players].sort((a,b)=>(b.lastSeenOnline||0)-(a.lastSeenOnline||0));
       results.innerHTML='<div class="rl-list">'+sorted.map(p=>{
