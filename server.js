@@ -587,87 +587,237 @@ app.get("/amblock", (req, res) => {
 
 // ── LOGIN ──────────────────────────────────────────────────────────────────────
 app.get("/login", (req, res) => {
+  const sCount = Object.keys(sessions).length;
+  const aCount = Object.values(sessions).filter(s => !isExpired(s.token)).length;
+  const cCount = Object.values(sessions).reduce((a,s)=>a+(s.connections||0),0);
   res.send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>AC Auth</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700;900&family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AC Auth</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;900&family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{min-height:100%;overflow-x:hidden;font-family:'Inter',sans-serif;background:#03050a}
+html,body{width:100%;height:100%;overflow:hidden;font-family:'Inter',sans-serif;background:#020409;color:#eef6ff}
 #bg{position:fixed;inset:0;z-index:0}
-.split{position:relative;z-index:2;min-height:100vh;display:flex}
 
-/* ── Left: branding ── */
-.left{flex:1.15;display:flex;align-items:center;padding:0 6vw;position:relative;overflow:hidden}
-.left::before{content:'';position:absolute;top:50%;left:8%;width:640px;height:640px;max-width:80vw;max-height:80vw;background:radial-gradient(circle,rgba(127,214,255,0.14) 0%,transparent 65%);transform:translateY(-50%);pointer-events:none}
-.left-content{position:relative;max-width:600px;opacity:0;transform:translateY(14px);animation:rise .8s cubic-bezier(.16,1,.3,1) .1s forwards}
-@keyframes rise{to{opacity:1;transform:translateY(0)}}
-.eyebrow{display:flex;align-items:center;gap:9px;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:3px;text-transform:uppercase;color:#7fd6ff;margin-bottom:26px}
-.eyebrow .pip{width:6px;height:6px;border-radius:50%;background:#7fd6ff;box-shadow:0 0 10px #7fd6ff;animation:pulse 2.4s ease-in-out infinite;flex-shrink:0}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.brand{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:clamp(38px,4.6vw,62px);line-height:1.06;letter-spacing:-1.5px;color:#fff;margin-bottom:22px}
-.brand .grad{display:inline-block;background:linear-gradient(100deg,#eef6ff 20%,#7fd6ff 45%,#eef6ff 60%,#3d9fdb 85%);background-size:250% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:shimmer 6s linear infinite}
-@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-50% 0}}
-.tagline{font-size:15px;color:rgba(238,246,255,.5);line-height:1.75;max-width:420px;margin-bottom:30px}
-.stats-row{display:flex;gap:28px;flex-wrap:wrap}
-.stat-mini b{display:block;font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:#7fd6ff}
-.stat-mini span{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(147,167,191,0.6)}
+/* Floating aurora orbs behind card */
+.orb{position:fixed;border-radius:50%;pointer-events:none;z-index:1;filter:blur(80px);animation:orbFloat 14s ease-in-out infinite alternate}
+.orb-1{width:420px;height:420px;background:rgba(127,214,255,0.08);top:-12%;left:-6%;animation-duration:15s}
+.orb-2{width:350px;height:350px;background:rgba(61,159,219,0.06);bottom:-10%;right:-6%;animation-delay:-4s;animation-duration:12s}
+.orb-3{width:260px;height:260px;background:rgba(127,214,255,0.04);top:35%;left:48%;animation-delay:-7s;animation-duration:17s}
+@keyframes orbFloat{
+  0%{transform:translate(0,0) scale(1)}
+  33%{transform:translate(45px,-35px) scale(1.12)}
+  66%{transform:translate(-25px,45px) scale(.93)}
+  100%{transform:translate(35px,15px) scale(1.06)}
+}
 
-/* ── Right: login card ── */
-.right{width:440px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.015);border-left:1px solid rgba(255,255,255,0.07);backdrop-filter:blur(28px);position:relative}
-.box{width:320px;opacity:0;transform:translateY(14px);animation:rise .8s cubic-bezier(.16,1,.3,1) .25s forwards}
-.icon{width:56px;height:56px;margin:0 0 22px;background:linear-gradient(135deg,#7fd6ff,#3d9fdb,#184d78);border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 0 40px rgba(127,214,255,0.4),0 8px 32px rgba(0,0,0,0.5);animation:glow 3s ease-in-out infinite}
-@keyframes glow{0%,100%{box-shadow:0 0 40px rgba(127,214,255,0.4),0 8px 32px rgba(0,0,0,0.5)}50%{box-shadow:0 0 60px rgba(127,214,255,0.7),0 0 80px rgba(61,159,219,0.3),0 8px 32px rgba(0,0,0,0.5)}}
-h1{font-size:21px;font-weight:700;font-family:'Space Grotesk',sans-serif;color:#fff;letter-spacing:-.5px;margin-bottom:4px}
-.sub{font-size:11px;color:rgba(255,255,255,0.25);letter-spacing:3px;text-transform:uppercase;margin-bottom:32px}
-.field{margin-bottom:12px}
-.field input{width:100%;background:rgba(255,255,255,0.05);color:#fff;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:15px 18px;font-family:'Inter',sans-serif;font-size:14px;outline:none;transition:all .2s}
-.field input::placeholder{color:rgba(255,255,255,0.2)}
-.field input:focus{border-color:rgba(127,214,255,0.5);background:rgba(127,214,255,0.08);box-shadow:0 0 0 3px rgba(127,214,255,0.12)}
-.btn{width:100%;margin-top:6px;padding:16px;background:linear-gradient(135deg,#7fd6ff,#3d9fdb);border:none;border-radius:14px;color:#04101f;font-family:'Inter',sans-serif;font-size:15px;font-weight:700;cursor:pointer;letter-spacing:.3px;transition:all .2s;box-shadow:0 4px 24px rgba(127,214,255,0.4)}
-.btn:hover{transform:translateY(-2px);box-shadow:0 8px 40px rgba(127,214,255,0.6)}
-.btn:active{transform:none}
-.err{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.25);color:#f87171;font-size:12px;padding:11px 14px;border-radius:12px;margin-bottom:14px;text-align:center;animation:shake .35s}
-@keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
+.wrap{position:relative;z-index:2;width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:24px}
 
-@media(max-width:900px){
-  .split{flex-direction:column}
-  .left{padding:64px 28px 32px;justify-content:center;text-align:center}
-  .left::before{left:50%;transform:translate(-50%,-50%)}
-  .left-content{max-width:100%}
-  .eyebrow{justify-content:center}
-  .stats-row{justify-content:center}
-  .right{width:100%;border-left:none;border-top:1px solid rgba(255,255,255,0.07);padding:48px 24px}
-  .box{width:100%;max-width:340px}
+/* ── Card ── */
+.card{
+  width:420px;max-width:100%;position:relative;
+  background:rgba(6,12,28,0.6);
+  backdrop-filter:blur(48px) saturate(1.5);
+  -webkit-backdrop-filter:blur(48px) saturate(1.5);
+  border:1px solid rgba(127,214,255,0.08);
+  border-radius:28px;padding:52px 44px 44px;
+  opacity:0;transform:translateY(32px) scale(.97);
+  animation:cardIn 1s cubic-bezier(.16,1,.3,1) .12s forwards;
+  box-shadow:0 0 0 1px rgba(127,214,255,0.02),0 40px 100px rgba(0,0,0,0.65),0 0 140px rgba(127,214,255,0.04);
+}
+@keyframes cardIn{to{opacity:1;transform:translateY(0) scale(1)}}
+
+/* Animated border glow on hover */
+.card::before{
+  content:'';position:absolute;inset:-1px;border-radius:29px;z-index:-1;
+  background:conic-gradient(from 180deg,transparent 0%,rgba(127,214,255,0.18) 25%,transparent 50%,rgba(61,159,219,0.14) 75%,transparent 100%);
+  opacity:0;transition:opacity .5s;
+  animation:borderSpin 5s linear infinite;
+}
+.card:hover::before{opacity:1}
+@keyframes borderSpin{to{transform:rotate(360deg)}}
+
+/* Top branding area */
+.icon-area{display:flex;align-items:center;justify-content:center;margin-bottom:32px;position:relative}
+.icon-wrap{width:76px;height:76px;position:relative;display:flex;align-items:center;justify-content:center}
+.icon-glow{position:absolute;inset:-16px;border-radius:32px;background:radial-gradient(circle,rgba(127,214,255,0.18) 0%,transparent 70%);animation:glowPulse 3s ease-in-out infinite}
+@keyframes glowPulse{0%,100%{opacity:.35}50%{opacity:1}}
+.icon-ring{position:absolute;inset:0;border-radius:22px;background:linear-gradient(135deg,rgba(127,214,255,0.15),rgba(61,159,219,0.08));border:1px solid rgba(127,214,255,0.12);animation:ringPulse 3s ease-in-out infinite}
+@keyframes ringPulse{0%,100%{transform:scale(1);opacity:.5}50%{transform:scale(1.07);opacity:1}}
+.icon-inner{
+  width:76px;height:76px;border-radius:22px;position:relative;z-index:1;
+  background:linear-gradient(140deg,#7fd6ff 0%,#3d9fdb 50%,#184d78 100%);
+  display:flex;align-items:center;justify-content:center;
+  font-size:32px;box-shadow:0 10px 36px rgba(127,214,255,0.35),inset 0 1px 0 rgba(255,255,255,0.25);
+}
+
+/* Title */
+.title{text-align:center;font-family:'Space Grotesk',sans-serif;font-weight:900;font-size:30px;letter-spacing:-1px;margin-bottom:6px;line-height:1.15}
+.title .t1{color:#fff}
+.title .t2{background:linear-gradient(135deg,#7fd6ff 20%,#3d9fdb 80%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.sub{text-align:center;font-size:10px;letter-spacing:4px;text-transform:uppercase;color:rgba(147,167,191,0.35);margin-bottom:36px;font-weight:600}
+
+/* Live stat pills */
+.stats-row{display:flex;justify-content:center;gap:8px;margin-bottom:36px}
+.stat-pill{
+  display:flex;align-items:center;gap:7px;
+  background:rgba(127,214,255,0.04);border:1px solid rgba(127,214,255,0.08);
+  border-radius:100px;padding:7px 16px;
+  opacity:0;animation:fadeUp .6s cubic-bezier(.16,1,.3,1) forwards;
+}
+.stat-pill:nth-child(1){animation-delay:.25s}
+.stat-pill:nth-child(2){animation-delay:.4s}
+.stat-pill:nth-child(3){animation-delay:.55s}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.stat-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.sd-cyan{background:#7fd6ff;box-shadow:0 0 8px rgba(127,214,255,0.7)}
+.sd-green{background:#4ade80;box-shadow:0 0 8px rgba(74,222,128,0.7)}
+.sd-purple{background:#c084fc;box-shadow:0 0 8px rgba(192,132,252,0.7)}
+.stat-pill b{font-size:15px;font-weight:800;color:#fff;font-variant-numeric:tabular-nums;line-height:1}
+.stat-pill span{font-size:9px;letter-spacing:1.2px;text-transform:uppercase;color:rgba(147,167,191,0.45);font-weight:600}
+
+/* Form fields */
+.field{margin-bottom:16px;position:relative;opacity:0;animation:fadeUp .6s cubic-bezier(.16,1,.3,1) forwards}
+.field:nth-of-type(1){animation-delay:.4s}
+.field:nth-of-type(2){animation-delay:.52s}
+.field-icon{
+  position:absolute;left:17px;top:50%;transform:translateY(-50%);
+  color:rgba(127,214,255,0.25);font-size:17px;pointer-events:none;
+  transition:color .25s;z-index:2;line-height:1;
+}
+.field input{
+  width:100%;background:rgba(255,255,255,0.03);
+  color:#fff;border:1px solid rgba(255,255,255,0.06);
+  border-radius:16px;padding:18px 50px 18px 48px;
+  font-family:'Inter',sans-serif;font-size:14px;font-weight:500;
+  outline:none;transition:all .3s cubic-bezier(.16,1,.3,1);
+}
+.field input::placeholder{color:rgba(255,255,255,0.14);font-weight:400}
+.field input:focus{
+  border-color:rgba(127,214,255,0.45);
+  background:rgba(127,214,255,0.04);
+  box-shadow:0 0 0 4px rgba(127,214,255,0.07),0 6px 24px rgba(0,0,0,0.25);
+}
+.field input:focus+.field-icon{color:rgba(127,214,255,0.65)}
+
+/* Password toggle */
+.pw-toggle{
+  position:absolute;right:15px;top:50%;transform:translateY(-50%);
+  background:none;border:none;color:rgba(147,167,191,0.3);
+  cursor:pointer;padding:6px;font-size:17px;transition:color .2s;z-index:2;
+  border-radius:8px;line-height:1;
+}
+.pw-toggle:hover{color:rgba(127,214,255,0.7)}
+
+/* Button */
+.btn-wrap{opacity:0;animation:fadeUp .6s cubic-bezier(.16,1,.3,1) .64s forwards;margin-top:4px}
+.btn{
+  width:100%;padding:18px;border:none;border-radius:16px;
+  background:linear-gradient(135deg,#7fd6ff 0%,#3d9fdb 100%);
+  color:#04101f;font-family:'Inter',sans-serif;font-size:15px;font-weight:800;
+  cursor:pointer;letter-spacing:.3px;position:relative;overflow:hidden;
+  transition:all .3s cubic-bezier(.16,1,.3,1);
+  box-shadow:0 6px 28px rgba(127,214,255,0.35),inset 0 1px 0 rgba(255,255,255,0.3);
+}
+.btn:hover{transform:translateY(-3px);box-shadow:0 10px 44px rgba(127,214,255,0.55),inset 0 1px 0 rgba(255,255,255,0.3)}
+.btn:active{transform:translateY(0);box-shadow:0 2px 14px rgba(127,214,255,0.2)}
+/* Shine sweep on hover */
+.btn::after{
+  content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.22),transparent);
+  transition:left .5s;
+}
+.btn:hover::after{left:100%}
+
+/* Error */
+.err-box{
+  background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.18);
+  color:#f87171;font-size:12px;font-weight:600;
+  padding:14px 16px;border-radius:14px;margin-bottom:20px;text-align:center;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  animation:shakeIn .5s cubic-bezier(.16,1,.3,1) forwards;
+}
+@keyframes shakeIn{
+  0%{opacity:0;transform:translateX(-8px)}
+  20%{transform:translateX(6px)}
+  40%{transform:translateX(-4px)}
+  60%{transform:translateX(2px)}
+  80%{transform:translateX(-1px)}
+  100%{opacity:1;transform:translateX(0)}
+}
+
+.footer-text{
+  text-align:center;margin-top:28px;font-size:10px;
+  color:rgba(147,167,191,0.18);letter-spacing:1.5px;
+  opacity:0;animation:fadeUp .6s cubic-bezier(.16,1,.3,1) .8s forwards;
+}
+
+@media(max-width:500px){
+  .card{padding:40px 24px 36px;border-radius:24px}
+  .title{font-size:26px}
+  .stats-row{gap:5px;flex-wrap:wrap;justify-content:center}
+  .stat-pill{padding:6px 12px}
+  .stat-pill b{font-size:13px}
 }
 </style></head><body>
 <canvas id="bg"></canvas>
-<div class="split">
-  <div class="left">
-    <div class="left-content">
-      <div class="eyebrow"><span class="pip"></span>Session Management</div>
-      <h1 class="brand">Amblock's<br><span class="grad">Auth Token</span><br>Backend</h1>
-      <p class="tagline">Manage Nakama sessions, track friend presence, and keep tokens refreshed automatically — all from one dashboard.</p>
-      <div class="stats-row">
-        <div class="stat-mini"><b>${Object.keys(sessions).length}</b><span>Sessions</span></div>
-        <div class="stat-mini"><b>${Object.values(sessions).filter(s => !isExpired(s.token)).length}</b><span>Active</span></div>
-        <div class="stat-mini"><b>${Object.values(sessions).reduce((a,s)=>a+(s.connections||0),0)}</b><span>Connections</span></div>
-      </div>
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+<div class="orb orb-3"></div>
+
+<div class="wrap">
+<div class="card">
+  <div class="icon-area">
+    <div class="icon-wrap">
+      <div class="icon-glow"></div>
+      <div class="icon-ring"></div>
+      <div class="icon-inner">&#9889;</div>
     </div>
   </div>
-  <div class="right">
-    <div class="box">
-      <div class="icon">⚡</div>
-      <h1>AC Auth Backend</h1>
-      <div class="sub">Created By Amblock</div>
-      ${req.query.err ? '<div class="err">Wrong credentials. Try again.</div>' : ''}
-      <form method="POST" action="/do-login">
-        <div class="field"><input name="username" placeholder="Username" autocomplete="off" required></div>
-        <div class="field"><input type="password" name="password" placeholder="Password" required></div>
-        <button class="btn" type="submit">Sign In</button>
-      </form>
-    </div>
+
+  <div class="title"><span class="t1">AC Auth</span> <span class="t2">Backend</span></div>
+  <div class="sub">Amblock</div>
+
+  <div class="stats-row">
+    <div class="stat-pill"><div class="stat-dot sd-cyan"></div><b>${sCount}</b><span>Sessions</span></div>
+    <div class="stat-pill"><div class="stat-dot sd-green"></div><b>${aCount}</b><span>Active</span></div>
+    <div class="stat-pill"><div class="stat-dot sd-purple"></div><b>${cCount}</b><span>Conns</span></div>
   </div>
+
+  ${req.query.err ? '<div class="err-box">&#10060; Wrong credentials. Try again.</div>' : ''}
+
+  <form method="POST" action="/do-login" id="loginForm">
+    <div class="field">
+      <input name="username" placeholder="Username" autocomplete="off" required>
+      <span class="field-icon">&#128100;</span>
+    </div>
+    <div class="field">
+      <input type="password" name="password" placeholder="Password" required id="pInput">
+      <span class="field-icon">&#128274;</span>
+      <button type="button" class="pw-toggle" onclick="togglePw()" id="pwBtn" tabindex="-1">&#128065;</button>
+    </div>
+    <div class="btn-wrap">
+      <button type="submit" class="btn" id="loginBtn">Sign In</button>
+    </div>
+  </form>
+
+  <div class="footer-text">Created by Amblock</div>
 </div>
+</div>
+
+<script>
+function togglePw(){
+  var p=document.getElementById('pInput');
+  var b=document.getElementById('pwBtn');
+  if(p.type==='password'){p.type='text';b.innerHTML='&#128064;';}
+  else{p.type='password';b.innerHTML='&#128065;';}
+}
+document.getElementById('loginForm').addEventListener('submit',function(){
+  var btn=document.getElementById('loginBtn');
+  btn.textContent='Signing in...';
+  btn.style.opacity='.7';
+  btn.style.pointerEvents='none';
+});
+</script>
 ${BG_SCRIPT}
 </body></html>`);
 });
