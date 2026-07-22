@@ -366,12 +366,12 @@ function handlePresenceBatch(session, state, presences, isLive) {
     if (!uid) continue;
     let parsed = {};
     try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
-    if (!parsed.roomCode) continue;
+    if (!parsed.roomCode) continue; // left / no room — nothing to cache or notify
     const u = state.byId[uid];
     const name = (u && (u.display_name || u.username)) || uid;
     const prev = roomCache[uid];
     const changed = !prev || prev.roomCode !== parsed.roomCode;
-    roomCache[uid] = { roomCode: parsed.roomCode, gameMode: parsed.gameMode, lastSeenOnline: Date.now(), name, rawStatus: parsed };
+    roomCache[uid] = { roomCode: parsed.roomCode, gameMode: parsed.gameMode, lastSeenOnline: Date.now(), name };
     dirty = true;
     if (isLive && state.warm && changed) {
       sendRoomJoinWebhook({
@@ -1284,7 +1284,7 @@ app.get("/session/:id/friends",async(req,res)=>{
       if(uid&&liveRoomCode){
         const prev=roomCache[uid];
         const isNewJoin=!!prev&&prev.roomCode!==liveRoomCode;
-        roomCache[uid]={roomCode:liveRoomCode,gameMode:pres.gameMode,lastSeenOnline:Date.now(),name,rawStatus:pres};
+        roomCache[uid]={roomCode:liveRoomCode,gameMode:pres.gameMode,lastSeenOnline:Date.now(),name};
         cacheDirty=true;
         if(isNewJoin){
           pendingWebhooks.push({
@@ -1318,175 +1318,6 @@ app.get("/session/:id/friends",async(req,res)=>{
     res.status(e.status||500).json({error:e.message});
   }
 });
-// ── ROOM CODE LOOKUP API ──────────────────────────────────────────────────────
-// Looks up a room code and returns all users who have that code in their status,
-// including any host/owner info from the game's status JSON.
-function fetchMatchList(token) {
-  return new Promise((resolve) => {
-    if (!WebSocket) return resolve({ error: "ws_not_installed", matches: [] });
-    let settled = false, sock;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try { sock && sock.close(); } catch (_) {}
-      resolve(result);
-    };
-    const timer = setTimeout(() => finish({ error: "timeout", matches: [] }), 15000);
-    try { sock = new WebSocket(nakamaWsUrl(token)); } catch (e) { return finish({ error: e.message }); }
-    sock.on("unexpected-response", (req, res) => {
-      let body = "";
-      res.on("data", (c) => { body += c; });
-      res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, matches: [] }));
-    });
-    sock.on("open", () => {
-      sock.send(JSON.stringify({ cid: "ml_1", match_list: { min_size: 1, max_size: 30, authoritative: true } }));
-    });
-    sock.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.cid === "ml_1") {
-          finish(msg.match_list ? { matches: msg.match_list.matches || [] } : msg.error ? { error: msg.error.message, matches: [] } : { matches: [] });
-        }
-      } catch (_) {}
-    });
-    sock.on("error", (e) => finish({ error: e.message, matches: [] }));
-    sock.on("close", (code) => { if (!settled) finish({ error: `ws_closed_${code}`, matches: [] }); });
-  });
-}
-
-function fetchMatchJoin(token, matchId) {
-  return new Promise((resolve) => {
-    if (!WebSocket) return resolve({ error: "ws_not_installed", presences: [], match: null });
-    let settled = false, sock;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try { sock && sock.close(); } catch (_) {}
-      resolve(result);
-    };
-    const timer = setTimeout(() => finish({ error: "timeout", presences: [], match: null }), 12000);
-    try { sock = new WebSocket(nakamaWsUrl(token)); } catch (e) { return finish({ error: e.message }); }
-    const sid = "mj_" + crypto.randomBytes(4).toString("hex");
-    sock.on("unexpected-response", (req, res) => {
-      let body = "";
-      res.on("data", (c) => { body += c; });
-      res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, presences: [], match: null }));
-    });
-    sock.on("open", () => {
-      sock.send(JSON.stringify({ cid: sid, match_join: { match_id: matchId } }));
-    });
-    sock.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.cid === sid) {
-          if (msg.match) finish({ match: msg.match, presences: msg.match.presences || [] });
-          else if (msg.error) finish({ error: msg.error.message, presences: [], match: null });
-        }
-      } catch (_) {}
-    });
-    sock.on("error", (e) => finish({ error: e.message, presences: [], match: null }));
-    sock.on("close", (code) => { if (!settled) finish({ error: `ws_closed_${code}`, presences: [], match: null }); });
-  });
-}
-
-function extractOwnerFromStatus(rawStatus) {
-  if (!rawStatus || typeof rawStatus !== "object") return null;
-  for (const key of ["isHost", "isHostPlayer", "host", "isOwner", "owner", "creator", "master", "leader", "is_room_owner", "isRoomHost"]) {
-    if (rawStatus[key] === true || rawStatus[key] === 1) return key;
-  }
-  return null;
-}
-
-app.get("/api/room-lookup/:roomCode", async (req, res) => {
-  const code = req.params.roomCode.trim();
-  if (!code) return res.json({ roomCode: code, playerCount: 0, players: [], errors: [] });
-
-  const activeSessions = Object.values(sessions).filter(s => s.token && !isExpired(s.token));
-  if (!activeSessions.length) return res.json({ roomCode: code, playerCount: 0, players: [], errors: ["No active sessions with valid tokens"] });
-
-  const token = activeSessions[0].token;
-  const errors = [];
-  const allPlayers = new Map();
-
-  // Strategy 1: Check roomCache (populated by live friend tracking)
-  for (const [uid, entry] of Object.entries(roomCache)) {
-    if (entry.roomCode === code) {
-      const ownerField = extractOwnerFromStatus(entry.rawStatus);
-      allPlayers.set(uid, {
-        userId: uid,
-        name: entry.name || uid,
-        gameMode: entry.gameMode,
-        lastSeenOnline: entry.lastSeenOnline,
-        isOwner: !!ownerField,
-        ownerField: ownerField,
-        source: "cache",
-        rawStatus: entry.rawStatus || null
-      });
-    }
-  }
-
-  // Strategy 2: List all matches and check labels + join to check statuses
-  const listResult = await fetchMatchList(token);
-  if (listResult.error) errors.push(`match_list: ${listResult.error}`);
-  const matches = listResult.matches || [];
-
-  for (const m of matches) {
-    let matched = false;
-
-    // Check label
-    try {
-      const lbl = JSON.parse(m.label || "{}");
-      if (lbl.roomCode === code || lbl.room_code === code || lbl.room === code || m.label === code) matched = true;
-    } catch (_) {
-      if (m.label === code) matched = true;
-    }
-
-    // Check presences' status for the room code
-    if (!matched && m.presences) {
-      for (const p of m.presences) {
-        try {
-          const st = JSON.parse(p.status || "{}");
-          if (st.roomCode === code || st.room_code === code) { matched = true; break; }
-        } catch (_) {}
-      }
-    }
-
-    if (matched && m.match_id) {
-      const joinResult = await fetchMatchJoin(token, m.match_id);
-      if (joinResult.error) { errors.push(`match_join ${m.match_id}: ${joinResult.error}`); continue; }
-      for (const p of (joinResult.presences || [])) {
-        let parsed = {};
-        try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
-        if (parsed.roomCode !== code && parsed.room_code !== code) continue;
-        const uid = p.user_id || "";
-        const ownerField = extractOwnerFromStatus(parsed);
-        if (!allPlayers.has(uid)) {
-          allPlayers.set(uid, {
-            userId: uid,
-            name: p.username || uid,
-            gameMode: parsed.gameMode ?? null,
-            isOwner: !!ownerField,
-            ownerField: ownerField,
-            source: "match",
-            rawStatus: parsed
-          });
-        } else if (ownerField) {
-          const existing = allPlayers.get(uid);
-          existing.isOwner = true;
-          existing.ownerField = ownerField;
-        }
-      }
-    }
-  }
-
-  const players = [...allPlayers.values()];
-  const owner = players.find(p => p.isOwner);
-  console.log(`[RoomLookup] "${code}": ${players.length} player(s), owner: ${owner ? owner.name : "unknown"}`);
-  res.json({ roomCode: code, playerCount: players.length, players, owner: owner || null, matchCount: matches.length, errors });
-});
-
 app.post("/update-tokens",(req,res)=>{
   const{token,refresh_token,id}=req.body;
   if(!token||!refresh_token)return res.status(400).json({error:"token and refresh_token required"});
@@ -1500,10 +1331,23 @@ app.get("/try-refresh",async(req,res)=>{
   for(const s of Object.values(sessions))results[s.id]=await tryRefresh(s);
   res.json(results);
 });
-// ── ROOM CODE LOOKUP PAGE ─────────────────────────────────────────────────────
+// ── ROOM LOOKUP API ──────────────────────────────────────────────────────────
+app.get("/api/room-cache", (req, res) => {
+  const code = (req.query.code || "").trim().toLowerCase();
+  if (!code) return res.json({ results: [] });
+  const results = [];
+  for (const [uid, info] of Object.entries(roomCache)) {
+    if (info.roomCode && info.roomCode.toLowerCase() === code) {
+      results.push({ userId: uid, name: info.name || uid, roomCode: info.roomCode, gameMode: info.gameMode, lastSeenOnline: info.lastSeenOnline });
+    }
+  }
+  res.json({ results });
+});
+
+// ── ROOM LOOKUP PAGE ─────────────────────────────────────────────────────────
 app.get("/room-lookup", (req, res) => {
   res.send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Room Code Lookup — AC Auth</title>
+<html><head><meta charset="utf-8"><title>Room Lookup — AC Auth</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700;900&family=Inter:wght@400;500;600;700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1513,7 +1357,7 @@ app.get("/room-lookup", (req, res) => {
   --border:rgba(255,255,255,0.07);--border-hi:rgba(255,255,255,0.14);
   --bg0:#03050a;--bg1:rgba(255,255,255,0.025);--bg2:rgba(255,255,255,0.04);
   --text:#eef6ff;--muted:rgba(147,167,191,0.35);--mono:'JetBrains Mono',monospace;
-  --gold:#f1c40f;
+  --success:#50fa7b;--danger:#ff5555;--purple:#c084fc;
 }
 html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;color:var(--text)}
 #bg{position:fixed;inset:0;z-index:0;pointer-events:none}
@@ -1539,49 +1383,51 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 .abtn:hover{transform:translateY(-1px);filter:brightness(1.1)}
 .abtn-ghost{background:var(--bg2);color:var(--pp);border:1px solid rgba(127,214,255,0.25)}
 .abtn-ghost:hover{background:var(--pp-dim)}
+.abtn-purple{background:linear-gradient(135deg,var(--pp),var(--pk));color:#fff;box-shadow:0 4px 16px rgba(127,214,255,0.3)}
 
 .rl-wrap{padding:32px 28px}
 .rl-title{font-size:26px;font-weight:900;color:#fff;letter-spacing:-.5px;margin-bottom:6px}
 .rl-sub{font-size:13px;color:var(--muted);margin-bottom:28px}
-.rl-search{display:flex;gap:10px;margin-bottom:24px;align-items:stretch}
-.rl-input{flex:1;background:var(--bg2);color:var(--text);border:1px solid var(--border);padding:14px 18px;font-family:var(--mono);font-size:14px;border-radius:14px;outline:none;transition:all .2s;letter-spacing:.5px}
-.rl-input::placeholder{color:var(--muted);letter-spacing:0}
-.rl-input:focus{border-color:rgba(127,214,255,0.45);box-shadow:0 0 0 3px rgba(127,214,255,0.1)}
-.rl-btn{background:linear-gradient(135deg,var(--pp),var(--pk));color:#fff;border:none;padding:14px 28px;border-radius:14px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Inter',sans-serif;transition:all .2s;box-shadow:0 4px 20px rgba(127,214,255,0.3);white-space:nowrap}
-.rl-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(127,214,255,0.5)}
-.rl-btn:active{transform:none}
-.rl-empty{text-align:center;padding:60px 20px;color:var(--muted)}
-.rl-empty-icon{font-size:48px;margin-bottom:12px;opacity:.3}
-.rl-empty-text{font-size:14px;margin-bottom:4px}
-.rl-empty-sub{font-size:12px;opacity:.5}
 
-/* Owner card */
-.owner-card{background:linear-gradient(135deg,rgba(241,196,15,0.08),rgba(241,196,15,0.02));border:1px solid rgba(241,196,15,0.25);border-radius:20px;padding:28px;margin-bottom:20px;display:none;position:relative;overflow:hidden}
-.owner-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--gold),transparent);opacity:.6}
-.owner-card.show{display:block}
-.owner-label{font-size:9px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.owner-label .pip{width:6px;height:6px;border-radius:50%;background:var(--gold);box-shadow:0 0 10px var(--gold);animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.owner-row{display:flex;align-items:center;gap:16px}
-.owner-avatar{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--gold),#e67e22);display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:900;color:#1a1a1a;flex-shrink:0;box-shadow:0 0 24px rgba(241,196,15,0.3)}
-.owner-info{flex:1;min-width:0}
-.owner-name{font-size:22px;font-weight:900;color:#fff;margin-bottom:2px}
-.owner-uid{font-size:11px;font-family:var(--mono);color:rgba(241,196,15,0.6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.owner-meta{display:flex;gap:8px;align-items:center;flex-shrink:0}
-.owner-badge{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:5px 12px;border-radius:100px;background:rgba(241,196,15,0.12);color:var(--gold);border:1px solid rgba(241,196,15,0.3)}
-.rl-copy{background:rgba(255,255,255,0.05);color:rgba(147,167,191,0.7);border:1px solid var(--border);padding:5px 10px;border-radius:8px;font-size:10px;font-family:'Inter',sans-serif;font-weight:600;cursor:pointer;transition:all .15s;flex-shrink:0}
-.rl-copy:hover{background:var(--pp-dim);color:var(--pp);border-color:rgba(127,214,255,0.3)}
+.search-box{display:flex;gap:10px;margin-bottom:28px}
+.search-input{flex:1;background:rgba(255,255,255,0.05);color:#fff;border:1px solid var(--border);padding:14px 18px;font-family:'Inter',sans-serif;font-size:14px;border-radius:14px;outline:none;transition:all .2s}
+.search-input::placeholder{color:var(--muted)}
+.search-input:focus{border-color:rgba(127,214,255,0.5);background:rgba(127,214,255,0.08);box-shadow:0 0 0 3px rgba(127,214,255,0.12)}
+.search-btn{padding:14px 28px;background:linear-gradient(135deg,var(--pp),var(--pk));border:none;border-radius:14px;color:#fff;font-family:'Inter',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .2s;box-shadow:0 4px 20px rgba(127,214,255,0.35);white-space:nowrap}
+.search-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(127,214,255,0.5)}
+.search-btn:active{transform:none}
 
-/* Other players in room */
-.others-header{font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
-.others-list{display:flex;flex-direction:column;gap:6px}
-.rl-player{display:flex;align-items:center;gap:12px;background:var(--bg1);border:1px solid var(--border);border-radius:12px;padding:10px 14px;transition:all .2s}
-.rl-player:hover{border-color:rgba(127,214,255,0.3)}
-.rl-avatar{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--pp),var(--pk));display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:900;color:#fff;flex-shrink:0}
-.rl-info{flex:1;min-width:0}
-.rl-name{font-size:13px;font-weight:700;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rl-uid{font-size:9px;font-family:var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rl-meta{display:flex;gap:6px;align-items:center;flex-shrink:0}
+.rl-status{font-size:12px;color:var(--muted);margin-bottom:20px;font-family:var(--mono);min-height:18px}
+.rl-status.err{color:var(--danger)}
+.rl-status.ok{color:var(--success)}
+
+.results{display:flex;flex-direction:column;gap:12px}
+.result-card{background:var(--bg1);border:1px solid var(--border);border-radius:18px;padding:22px 24px;display:flex;align-items:center;gap:18px;transition:all .2s;animation:fadeIn .3s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.result-card:hover{border-color:rgba(127,214,255,0.3);transform:translateY(-2px);box-shadow:0 12px 40px rgba(0,0,0,0.4)}
+.result-avatar{width:52px;height:52px;border-radius:16px;background:linear-gradient(135deg,var(--pp),var(--pk));display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;box-shadow:0 4px 16px rgba(127,214,255,0.3)}
+.result-info{flex:1;min-width:0}
+.result-name{font-size:17px;font-weight:800;color:#fff;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.result-grid{display:flex;flex-wrap:wrap;gap:8px 20px}
+.result-field{font-size:11px;display:flex;align-items:center;gap:6px}
+.result-label{font-size:9px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)}
+.result-value{font-family:var(--mono);font-size:11px;color:rgba(147,167,191,0.7);word-break:break-all}
+.result-value.id-val{color:var(--pp);cursor:pointer;transition:color .15s}
+.result-value.id-val:hover{color:#fff}
+.result-modes{display:flex;gap:6px;margin-top:8px}
+.mode-tag{font-size:10px;font-weight:700;letter-spacing:.5px;padding:3px 10px;border-radius:100px}
+.mode-adventure{color:#4ade80;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.25)}
+.mode-arena{color:#f87171;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.25)}
+.mode-hardcore{color:#fbbf24;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.25)}
+.mode-devsandbox{color:#c084fc;background:rgba(192,132,252,0.12);border:1px solid rgba(192,132,252,0.25)}
+.mode-unknown{color:#9ca3af;background:rgba(156,163,175,0.08);border:1px solid var(--border)}
+.result-copy{background:rgba(255,255,255,0.05);color:rgba(147,167,191,0.7);border:1px solid var(--border);padding:8px 14px;border-radius:10px;font-size:10px;font-family:'Inter',sans-serif;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0}
+.result-copy:hover{background:var(--pp-dim);color:var(--pp);border-color:rgba(127,214,255,0.3)}
+
+.empty-state{text-align:center;padding:60px 20px;color:var(--muted)}
+.empty-icon{font-size:48px;margin-bottom:16px;opacity:.4}
+.empty-text{font-size:14px;font-weight:600;margin-bottom:6px}
+.empty-hint{font-size:12px;opacity:.6}
 
 .toast{position:fixed;bottom:28px;right:28px;background:linear-gradient(135deg,var(--pp),var(--pk));color:#fff;padding:10px 20px;border-radius:12px;font-size:12px;font-weight:700;z-index:999;opacity:0;transform:translateY(10px) scale(.95);transition:all .25s;pointer-events:none;box-shadow:0 8px 32px rgba(127,214,255,0.4)}
 .toast.show{opacity:1;transform:translateY(0) scale(1)}
@@ -1607,93 +1453,78 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 </div>
 
 <div class="rl-wrap">
-  <div class="rl-title">Room Code Lookup</div>
-  <div class="rl-sub">Enter a room code to find out who owns it</div>
+  <div class="rl-title">Room Lookup</div>
+  <div class="rl-sub">Enter a room code to find who owns it and their user ID</div>
 
-  <div class="rl-search">
-    <input class="rl-input" id="roomInput" type="text" placeholder="Enter room code..." autocomplete="off" autofocus>
-    <button class="rl-btn" id="searchBtn" onclick="lookupRoom()">Lookup</button>
+  <div class="search-box">
+    <input class="search-input" type="text" id="roomInput" placeholder="Enter room code..." autocomplete="off" autofocus>
+    <button class="search-btn" id="searchBtn" onclick="doSearch()">Search</button>
   </div>
-
-  <div class="owner-card" id="ownerCard">
-    <div class="owner-label"><span class="pip"></span>Room Owner</div>
-    <div class="owner-row">
-      <div class="owner-avatar" id="ownerAvatar">?</div>
-      <div class="owner-info">
-        <div class="owner-name" id="ownerName">—</div>
-        <div class="owner-uid" id="ownerUid">—</div>
-      </div>
-      <div class="owner-meta">
-        <span class="owner-badge">HOST</span>
-        <button class="rl-copy" onclick="copyText(document.getElementById('ownerUid').textContent)">Copy ID</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="results">
-    <div class="rl-empty">
-      <div class="rl-empty-icon">🔍</div>
-      <div class="rl-empty-text">Enter a room code above</div>
-      <div class="rl-empty-sub">We'll find who owns that code</div>
-    </div>
-  </div>
+  <div class="rl-status" id="status"></div>
+  <div class="results" id="results"></div>
 </div>
 </div>
 <div class="toast" id="toast"></div>
 
 <script>
-const GM_LABELS={0:'Adventure',1:'Arena',2:'Hardcore',3:'DevSandbox'};
+const GM={0:'Adventure',1:'Arena',2:'Hardcore',3:'DevSandbox'};
 const GM_EMOJI={0:'🗺️',1:'⚔️',2:'💀',3:'🧪'};
-function copyText(t){navigator.clipboard.writeText(t);const el=document.getElementById('toast');el.textContent='Copied!';el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),1800);}
-document.getElementById('roomInput').addEventListener('keydown',e=>{if(e.key==='Enter')lookupRoom();});
+const GM_CLS={0:'mode-adventure',1:'mode-arena',2:'mode-hardcore',3:'mode-devsandbox'};
 
-async function lookupRoom(){
-  const code=document.getElementById('roomInput').value.trim();
-  if(!code){document.getElementById('roomInput').focus();return;}
-  const btn=document.getElementById('searchBtn');
-  const ownerCard=document.getElementById('ownerCard');
-  const results=document.getElementById('results');
-  btn.textContent='Looking up...';btn.disabled=true;
-  ownerCard.classList.remove('show');
-  results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="opacity:.5">Searching for room '+code+'...</div></div>';
-
-  try{
-    const r=await fetch('/api/room-lookup/'+encodeURIComponent(code));
-    const data=await r.json();
-
-    if(data.owner){
-      const o=data.owner;
-      document.getElementById('ownerAvatar').textContent=(o.name||'?')[0].toUpperCase();
-      document.getElementById('ownerName').textContent=o.name||'Unknown';
-      document.getElementById('ownerUid').textContent=o.userId;
-      ownerCard.classList.add('show');
-    }
-
-    const others=data.players.filter(p=>!p.isOwner);
-    if(!data.players.length){
-      results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">❌</div><div class="rl-empty-text">No one found with room code '+code+'</div><div class="rl-empty-sub">'+(data.errors&&data.errors.length?data.errors.join('; '):'The room may be empty or the code may be invalid')+'</div></div>';
-    } else if(others.length===0){
-      results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="color:var(--gold)">Only the owner found — no other players detected in this room</div></div>';
-    } else {
-      results.innerHTML='<div class="others-header">Other players in this room ('+others.length+')</div><div class="others-list">'+others.map(p=>{
-        const initial=(p.name||'?')[0].toUpperCase();
-        const gmLabel=GM_LABELS[p.gameMode]||'';
-        const gmEmoji=GM_EMOJI[p.gameMode]||'';
-        return '<div class="rl-player">'
-          +'<div class="rl-avatar">'+initial+'</div>'
-          +'<div class="rl-info"><div class="rl-name">'+(p.name||'Unknown').replace(/</g,'&lt;')+'</div><div class="rl-uid">'+p.userId+'</div></div>'
-          +'<div class="rl-meta">'
-            +(gmLabel?'<span class="rl-badge rl-mode" style="font-size:9px;padding:3px 8px">'+gmEmoji+' '+gmLabel+'</span>':'')
-            +'<button class="rl-copy" onclick="copyText(\''+p.userId+'\')">Copy ID</button>'
-          +'</div></div>';
-      }).join('')+'</div>';
-    }
-  }catch(e){
-    results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">⚠️</div><div class="rl-empty-text">Error</div><div class="rl-empty-sub">'+e.message+'</div></div>';
-  }
-  btn.textContent='Lookup';btn.disabled=false;
+function timeAgo(ts){
+  const s=Math.floor((Date.now()-ts)/1000);
+  if(s<60)return s+'s ago';
+  const m=Math.floor(s/60);
+  if(m<60)return m+'m ago';
+  const h=Math.floor(m/60);
+  if(h<24)return h+'h ago';
+  return Math.floor(h/24)+'d ago';
 }
+function copy(t,msg){navigator.clipboard.writeText(t);const el=document.getElementById('toast');el.textContent=msg||'Copied!';el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),1800);}
 
+async function doSearch(){
+  const code=document.getElementById('roomInput').value.trim();
+  const status=document.getElementById('status');
+  const results=document.getElementById('results');
+  if(!code){status.className='rl-status';status.textContent='';results.innerHTML='';return;}
+  status.className='rl-status';status.textContent='Searching...';
+  results.innerHTML='';
+  try{
+    const r=await fetch('/api/room-cache?code='+encodeURIComponent(code));
+    const data=await r.json();
+    const items=data.results||[];
+    if(!items.length){
+      status.className='rl-status';status.textContent='No players found in room "'+code+'"';
+      results.innerHTML='<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-text">No results</div><div class="empty-hint">No tracked players are currently in this room</div></div>';
+      return;
+    }
+    status.className='rl-status ok';status.textContent='Found '+items.length+' player'+(items.length===1?'':'s')+' in room "'+code+'"';
+    results.innerHTML=items.map(p=>{
+      const gm=p.gameMode;
+      const gmLabel=GM[gm]||'Unknown';
+      const gmEmoji=GM_EMOJI[gm]||'🎮';
+      const gmCls=GM_CLS[gm]||'mode-unknown';
+      const ago=p.lastSeenOnline?timeAgo(p.lastSeenOnline):'';
+      return '<div class="result-card">'
+        +'<div class="result-avatar">👤</div>'
+        +'<div class="result-info">'
+          +'<div class="result-name">'+escHtml(p.name||p.userId)+'</div>'
+          +'<div class="result-grid">'
+            +'<div class="result-field"><span class="result-label">User ID</span><span class="result-value id-val" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')" title="Click to copy">'+p.userId+'</span></div>'
+            +'<div class="result-field"><span class="result-label">Room</span><span class="result-value">'+escHtml(p.roomCode)+'</span></div>'
+            +'<div class="result-field"><span class="result-label">Last Seen</span><span class="result-value">'+ago+'</span></div>'
+          +'</div>'
+          +'<div class="result-modes"><span class="mode-tag '+gmCls+'">'+gmEmoji+' '+gmLabel+'</span></div>'
+        +'</div>'
+        +'<button class="result-copy" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')">📋 Copy ID</button>'
+      +'</div>';
+    }).join('');
+  }catch(e){
+    status.className='rl-status err';status.textContent='Search failed: '+e.message;
+  }
+}
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+document.getElementById('roomInput').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch();});
 (function tick(){document.getElementById('clock').textContent=new Date().toLocaleTimeString();setTimeout(tick,1000);})();
 </script>
 ${BG_SCRIPT}
