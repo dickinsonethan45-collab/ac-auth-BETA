@@ -34,6 +34,7 @@ function requireLogin(req, res, next) {
   if (req.path.startsWith("/v2/") || req.path === "/update-tokens" || req.path === "/try-refresh") return next();
   if (req.path === "/login" || req.path === "/do-login") return next();
   if (req.path === "/session/create" || req.path === "/refresh-all" || req.path === "/clean-duplicates") return next();
+  if (req.path === "/session-logout" || req.path === "/api/logout-session") return next();
   const token = req.cookies?.auth;
   if (token && authSessions.has(token)) return next();
   res.redirect("/login");
@@ -943,7 +944,7 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
   <div class="made-by"><div class="made-by-dot"></div><div class="made-by-text">Created By Amblock</div></div>
   <nav class="hdr-nav">
     <a href="/" class="hnav-btn hnav-active">Sessions</a>
-    <a href="/room-lookup" class="hnav-btn">Room Lookup</a>
+    <a href="/session-logout" class="hnav-btn">Session Logout</a>
     <a href="/symbol-getter" class="hnav-btn">Symbol Getter</a>
   </nav>
   <div class="hdr-r">
@@ -1331,25 +1332,50 @@ app.get("/try-refresh",async(req,res)=>{
   for(const s of Object.values(sessions))results[s.id]=await tryRefresh(s);
   res.json(results);
 });
-// ── ROOM LOOKUP API ──────────────────────────────────────────────────────────
-app.get("/api/room-cache", (req, res) => {
-  const code = (req.query.code || "").trim().toLowerCase();
-  if (!code) return res.json({ owner: null });
-  let owner = null;
-  for (const [uid, info] of Object.entries(roomCache)) {
-    if (info.roomCode && info.roomCode.toLowerCase() === code) {
-      if (!owner || (info.firstSeenOnline || info.lastSeenOnline) < (owner.firstSeenOnline || owner.lastSeenOnline)) {
-        owner = { userId: uid, name: info.name || uid, roomCode: info.roomCode, gameMode: info.gameMode, firstSeenOnline: info.firstSeenOnline || info.lastSeenOnline, lastSeenOnline: info.lastSeenOnline };
+// ── SESSION LOGOUT API ───────────────────────────────────────────────────────
+app.post("/api/logout-session", async (req, res) => {
+  const { token } = req.body;
+  if (!token || !token.trim()) return res.status(400).json({ ok: false, error: "Token is required" });
+  const t = token.trim();
+  try {
+    const r = await fetch(`${NAKAMA_SERVER}/v2/session/logout`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${t}`,
+        "Content-Type": "application/json",
+        "User-Agent": "UnityPlayer/6000.3.12f1 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)",
+        "x-unity-version": "6000.3.12f1"
+      },
+      body: "{}"
+    });
+    const status = r.status;
+    const text = await r.text();
+    if (status === 200) {
+      let matchedSession = null;
+      for (const s of Object.values(sessions)) {
+        if (s.token === t || s.refresh_token === t) { matchedSession = s; break; }
       }
+      if (matchedSession) {
+        const ex = liveSockets[matchedSession.id];
+        if (ex && ex.sock) { try { ex.sock.removeAllListeners(); ex.sock.close(); } catch (_) {} }
+        delete liveSockets[matchedSession.id];
+        matchedSession.token = "";
+        matchedSession.refresh_token = "";
+        saveSessions();
+      }
+      return res.json({ ok: true, status, message: "Session invalidated successfully" });
+    } else {
+      return res.json({ ok: false, status, error: `Nakama returned HTTP ${status}: ${text.slice(0, 200)}` });
     }
+  } catch (e) {
+    return res.json({ ok: false, error: e.message });
   }
-  res.json({ owner });
 });
 
-// ── ROOM LOOKUP PAGE ─────────────────────────────────────────────────────────
-app.get("/room-lookup", (req, res) => {
+// ── SESSION LOGOUT PAGE ──────────────────────────────────────────────────────
+app.get("/session-logout", (req, res) => {
   res.send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Room Lookup — AC Auth</title>
+<html><head><meta charset="utf-8"><title>Session Logout — AC Auth</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700;900&family=Inter:wght@400;500;600;700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1359,7 +1385,7 @@ app.get("/room-lookup", (req, res) => {
   --border:rgba(255,255,255,0.07);--border-hi:rgba(255,255,255,0.14);
   --bg0:#03050a;--bg1:rgba(255,255,255,0.025);--bg2:rgba(255,255,255,0.04);
   --text:#eef6ff;--muted:rgba(147,167,191,0.35);--mono:'JetBrains Mono',monospace;
-  --success:#50fa7b;--danger:#ff5555;--purple:#c084fc;
+  --success:#50fa7b;--danger:#ff5555;--warning:#fbbf24;
 }
 html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;color:var(--text)}
 #bg{position:fixed;inset:0;z-index:0;pointer-events:none}
@@ -1385,51 +1411,33 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 .abtn:hover{transform:translateY(-1px);filter:brightness(1.1)}
 .abtn-ghost{background:var(--bg2);color:var(--pp);border:1px solid rgba(127,214,255,0.25)}
 .abtn-ghost:hover{background:var(--pp-dim)}
-.abtn-purple{background:linear-gradient(135deg,var(--pp),var(--pk));color:#fff;box-shadow:0 4px 16px rgba(127,214,255,0.3)}
+.abtn-red{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;box-shadow:0 4px 16px rgba(239,68,68,0.3)}
+.abtn-red:hover{box-shadow:0 8px 32px rgba(239,68,68,0.5)}
 
-.rl-wrap{padding:32px 28px}
-.rl-title{font-size:26px;font-weight:900;color:#fff;letter-spacing:-.5px;margin-bottom:6px}
-.rl-sub{font-size:13px;color:var(--muted);margin-bottom:28px}
+.sl-wrap{padding:32px 28px}
+.sl-title{font-size:26px;font-weight:900;color:#fff;letter-spacing:-.5px;margin-bottom:6px}
+.sl-sub{font-size:13px;color:var(--muted);margin-bottom:28px}
 
-.search-box{display:flex;gap:10px;margin-bottom:28px}
-.search-input{flex:1;background:rgba(255,255,255,0.05);color:#fff;border:1px solid var(--border);padding:14px 18px;font-family:'Inter',sans-serif;font-size:14px;border-radius:14px;outline:none;transition:all .2s}
-.search-input::placeholder{color:var(--muted)}
-.search-input:focus{border-color:rgba(127,214,255,0.5);background:rgba(127,214,255,0.08);box-shadow:0 0 0 3px rgba(127,214,255,0.12)}
-.search-btn{padding:14px 28px;background:linear-gradient(135deg,var(--pp),var(--pk));border:none;border-radius:14px;color:#fff;font-family:'Inter',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .2s;box-shadow:0 4px 20px rgba(127,214,255,0.35);white-space:nowrap}
-.search-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(127,214,255,0.5)}
-.search-btn:active{transform:none}
+.token-box{background:rgba(255,255,255,0.025);border:1px solid var(--border);border-radius:18px;padding:24px;margin-bottom:24px}
+.token-label{font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.token-input{width:100%;background:rgba(0,0,0,0.3);color:#fff;border:1px solid var(--border);padding:14px 18px;font-family:var(--mono);font-size:12px;border-radius:14px;outline:none;transition:all .2s;resize:none;line-height:1.6}
+.token-input::placeholder{color:rgba(255,255,255,0.15)}
+.token-input:focus{border-color:rgba(239,68,68,0.5);background:rgba(239,68,68,0.05);box-shadow:0 0 0 3px rgba(239,68,68,0.1)}
+.token-hint{font-size:11px;color:var(--muted);margin-top:8px}
+.token-hint strong{color:var(--warning)}
 
-.rl-status{font-size:12px;color:var(--muted);margin-bottom:20px;font-family:var(--mono);min-height:18px}
-.rl-status.err{color:var(--danger)}
-.rl-status.ok{color:var(--success)}
+.logout-btn{width:100%;padding:16px;background:linear-gradient(135deg,#ef4444,#dc2626);border:none;border-radius:14px;color:#fff;font-family:'Inter',sans-serif;font-size:15px;font-weight:700;cursor:pointer;transition:all .2s;box-shadow:0 4px 24px rgba(239,68,68,0.35);letter-spacing:.3px}
+.logout-btn:hover{transform:translateY(-2px);box-shadow:0 8px 40px rgba(239,68,68,0.5)}
+.logout-btn:active{transform:none}
+.logout-btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
 
-.results{display:flex;flex-direction:column;gap:12px}
-.result-card{background:var(--bg1);border:1px solid var(--border);border-radius:18px;padding:22px 24px;display:flex;align-items:center;gap:18px;transition:all .2s;animation:fadeIn .3s ease}
+.sl-status{margin-top:20px;padding:16px 20px;border-radius:14px;font-size:13px;font-weight:600;display:none;line-height:1.6}
+.sl-status.show{display:block;animation:fadeIn .3s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.result-card:hover{border-color:rgba(127,214,255,0.3);transform:translateY(-2px);box-shadow:0 12px 40px rgba(0,0,0,0.4)}
-.result-avatar{width:52px;height:52px;border-radius:16px;background:linear-gradient(135deg,var(--pp),var(--pk));display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;box-shadow:0 4px 16px rgba(127,214,255,0.3)}
-.result-info{flex:1;min-width:0}
-.result-name{font-size:17px;font-weight:800;color:#fff;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.result-grid{display:flex;flex-wrap:wrap;gap:8px 20px}
-.result-field{font-size:11px;display:flex;align-items:center;gap:6px}
-.result-label{font-size:9px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)}
-.result-value{font-family:var(--mono);font-size:11px;color:rgba(147,167,191,0.7);word-break:break-all}
-.result-value.id-val{color:var(--pp);cursor:pointer;transition:color .15s}
-.result-value.id-val:hover{color:#fff}
-.result-modes{display:flex;gap:6px;margin-top:8px}
-.mode-tag{font-size:10px;font-weight:700;letter-spacing:.5px;padding:3px 10px;border-radius:100px}
-.mode-adventure{color:#4ade80;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.25)}
-.mode-arena{color:#f87171;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.25)}
-.mode-hardcore{color:#fbbf24;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.25)}
-.mode-devsandbox{color:#c084fc;background:rgba(192,132,252,0.12);border:1px solid rgba(192,132,252,0.25)}
-.mode-unknown{color:#9ca3af;background:rgba(156,163,175,0.08);border:1px solid var(--border)}
-.result-copy{background:rgba(255,255,255,0.05);color:rgba(147,167,191,0.7);border:1px solid var(--border);padding:8px 14px;border-radius:10px;font-size:10px;font-family:'Inter',sans-serif;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0}
-.result-copy:hover{background:var(--pp-dim);color:var(--pp);border-color:rgba(127,214,255,0.3)}
-
-.empty-state{text-align:center;padding:60px 20px;color:var(--muted)}
-.empty-icon{font-size:48px;margin-bottom:16px;opacity:.4}
-.empty-text{font-size:14px;font-weight:600;margin-bottom:6px}
-.empty-hint{font-size:12px;opacity:.6}
+.sl-status.ok{background:rgba(80,250,123,0.1);border:1px solid rgba(80,250,123,0.25);color:var(--success)}
+.sl-status.err{background:rgba(255,85,85,0.1);border:1px solid rgba(255,85,85,0.25);color:var(--danger)}
+.sl-status.loading{background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25);color:var(--warning)}
+.sl-status-icon{font-size:18px;margin-right:8px}
 
 .toast{position:fixed;bottom:28px;right:28px;background:linear-gradient(135deg,var(--pp),var(--pk));color:#fff;padding:10px 20px;border-radius:12px;font-size:12px;font-weight:700;z-index:999;opacity:0;transform:translateY(10px) scale(.95);transition:all .25s;pointer-events:none;box-shadow:0 8px 32px rgba(127,214,255,0.4)}
 .toast.show{opacity:1;transform:translateY(0) scale(1)}
@@ -1443,7 +1451,7 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
   <div class="made-by"><div class="made-by-dot"></div><div class="made-by-text">Created By Amblock</div></div>
   <nav class="hdr-nav">
     <a href="/" class="hnav-btn">Sessions</a>
-    <a href="/room-lookup" class="hnav-btn hnav-active">Room Lookup</a>
+    <a href="/session-logout" class="hnav-btn hnav-active">Session Logout</a>
     <a href="/symbol-getter" class="hnav-btn">Symbol Getter</a>
   </nav>
   <div class="hdr-r">
@@ -1454,79 +1462,50 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
   </div>
 </div>
 
-<div class="rl-wrap">
-  <div class="rl-title">Room Lookup</div>
-  <div class="rl-sub">Enter a room code to find the owner and their user ID</div>
+<div class="sl-wrap">
+  <div class="sl-title">Session Logout</div>
+  <div class="sl-sub">Paste a session token to invalidate it on the Nakama server</div>
 
-  <div class="search-box">
-    <input class="search-input" type="text" id="roomInput" placeholder="Enter room code..." autocomplete="off" autofocus>
-    <button class="search-btn" id="searchBtn" onclick="doSearch()">Search</button>
+  <div class="token-box">
+    <div class="token-label">Session Token</div>
+    <textarea class="token-input" id="tokenInput" rows="4" placeholder="Paste the full session token here..." autofocus></textarea>
+    <div class="token-hint">This will call <strong>/v2/session/logout</strong> on Nakama, making the token and its linked refresh token unusable.</div>
   </div>
-  <div class="rl-status" id="status"></div>
-  <div class="results" id="results"></div>
+
+  <button class="logout-btn" id="logoutBtn" onclick="doLogout()">Invalidate Session</button>
+
+  <div class="sl-status" id="status"></div>
 </div>
 </div>
 <div class="toast" id="toast"></div>
 
 <script>
-const GM={0:'Adventure',1:'Arena',2:'Hardcore',3:'DevSandbox'};
-const GM_EMOJI={0:'🗺️',1:'⚔️',2:'💀',3:'🧪'};
-const GM_CLS={0:'mode-adventure',1:'mode-arena',2:'mode-hardcore',3:'mode-devsandbox'};
-
-function timeAgo(ts){
-  const s=Math.floor((Date.now()-ts)/1000);
-  if(s<60)return s+'s ago';
-  const m=Math.floor(s/60);
-  if(m<60)return m+'m ago';
-  const h=Math.floor(m/60);
-  if(h<24)return h+'h ago';
-  return Math.floor(h/24)+'d ago';
-}
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function copy(t,msg){navigator.clipboard.writeText(t);const el=document.getElementById('toast');el.textContent=msg||'Copied!';el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),1800);}
 
-async function doSearch(){
-  const code=document.getElementById('roomInput').value.trim();
+async function doLogout(){
+  const token=document.getElementById('tokenInput').value.trim();
   const status=document.getElementById('status');
-  const results=document.getElementById('results');
-  if(!code){status.className='rl-status';status.textContent='';results.innerHTML='';return;}
-  status.className='rl-status';status.textContent='Searching...';
-  results.innerHTML='';
+  const btn=document.getElementById('logoutBtn');
+  if(!token){status.className='sl-status show err';status.innerHTML='<span class="sl-status-icon">⚠️</span>Please paste a token first.';return;}
+  btn.disabled=true;btn.textContent='Logging out...';
+  status.className='sl-status show loading';status.innerHTML='<span class="sl-status-icon">⏳</span>Invalidating session...';
   try{
-    const r=await fetch('/api/room-cache?code='+encodeURIComponent(code));
+    const r=await fetch('/api/logout-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})});
     const data=await r.json();
-    const p=data.owner;
-    if(!p){
-      status.className='rl-status';status.textContent='No owner found for room "'+code+'"';
-      results.innerHTML='<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-text">No results</div><div class="empty-hint">No tracked player has been detected as owner of this room</div></div>';
-      return;
+    if(data.ok){
+      status.className='sl-status show ok';
+      status.innerHTML='<span class="sl-status-icon">✅</span><strong>Session invalidated!</strong><br>The token and its linked refresh token are now unusable.'+(data.matchedSession?'<br>Local session <strong>'+escHtml(data.matchedSession)+'</strong> cleared.':'');
+    }else{
+      status.className='sl-status show err';
+      status.innerHTML='<span class="sl-status-icon">❌</span><strong>Logout failed.</strong><br>'+escHtml(data.error||'Unknown error')+(data.status?' (HTTP '+data.status+')':'');
     }
-    status.className='rl-status ok';status.textContent='Room owner found!';
-    const gm=p.gameMode;
-    const gmLabel=GM[gm]||'Unknown';
-    const gmEmoji=GM_EMOJI[gm]||'🎮';
-    const gmCls=GM_CLS[gm]||'mode-unknown';
-    const createdAgo=p.firstSeenOnline?timeAgo(p.firstSeenOnline):'';
-    const seenAgo=p.lastSeenOnline?timeAgo(p.lastSeenOnline):'';
-    results.innerHTML='<div class="result-card">'
-      +'<div class="result-avatar">👑</div>'
-      +'<div class="result-info">'
-        +'<div class="result-name">'+escHtml(p.name||p.userId)+'</div>'
-        +'<div class="result-grid">'
-          +'<div class="result-field"><span class="result-label">User ID</span><span class="result-value id-val" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')" title="Click to copy">'+p.userId+'</span></div>'
-          +'<div class="result-field"><span class="result-label">Room Code</span><span class="result-value">'+escHtml(p.roomCode)+'</span></div>'
-          +'<div class="result-field"><span class="result-label">First Seen</span><span class="result-value">'+createdAgo+'</span></div>'
-          +'<div class="result-field"><span class="result-label">Last Seen</span><span class="result-value">'+seenAgo+'</span></div>'
-        +'</div>'
-        +'<div class="result-modes"><span class="mode-tag '+gmCls+'">'+gmEmoji+' '+gmLabel+'</span></div>'
-      +'</div>'
-      +'<button class="result-copy" onclick="copy(\\''+p.userId+'\\',\\'User ID copied\\')">📋 Copy ID</button>'
-    +'</div>';
   }catch(e){
-    status.className='rl-status err';status.textContent='Search failed: '+e.message;
+    status.className='sl-status show err';status.innerHTML='<span class="sl-status-icon">❌</span>Network error: '+escHtml(e.message);
   }
+  btn.disabled=false;btn.textContent='Invalidate Session';
 }
-function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-document.getElementById('roomInput').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch();});
+document.getElementById('tokenInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doLogout();}});
 (function tick(){document.getElementById('clock').textContent=new Date().toLocaleTimeString();setTimeout(tick,1000);})();
 </script>
 ${BG_SCRIPT}
@@ -1614,7 +1593,7 @@ pre{padding:18px;font-size:11px;color:rgba(147,167,191,0.5);font-family:var(--mo
   <div class="made-by"><div class="made-by-dot"></div><div class="made-by-text">Created By Amblock</div></div>
   <nav class="hdr-nav">
     <a href="/" class="hnav-btn">Sessions</a>
-    <a href="/room-lookup" class="hnav-btn">Room Lookup</a>
+    <a href="/session-logout" class="hnav-btn">Session Logout</a>
     <a href="/symbol-getter" class="hnav-btn hnav-active">Symbol Getter</a>
   </nav>
   <div class="hdr-r">
