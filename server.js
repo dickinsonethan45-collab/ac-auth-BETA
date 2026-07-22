@@ -1319,141 +1319,232 @@ app.get("/session/:id/friends",async(req,res)=>{
   }
 });
 // ── ROOM CODE LOOKUP API ──────────────────────────────────────────────────────
-// Scans ALL sessions' friends via live WebSocket presence, then searches the
-// roomCache for players matching the requested room code.
-// NOTE: Nakama has no "search users by roomCode" API — we can only see
-// presence of users whose IDs we know (friends across all tracked sessions).
+// Uses Nakama's match_list WebSocket API to find active matches/rooms
+// and their presences — no friend list required.
+function fetchMatchList(token) {
+  return new Promise((resolve) => {
+    if (!WebSocket) return resolve({ error: "ws_not_installed", matches: [] });
+    let settled = false, sock;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { sock && sock.close(); } catch (_) {}
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ error: "timeout", matches: [] }), 15000);
+    try { sock = new WebSocket(nakamaWsUrl(token)); } catch (e) { return finish({ error: e.message }); }
+    sock.on("unexpected-response", (req, res) => {
+      let body = "";
+      res.on("data", (c) => { body += c; });
+      res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, matches: [] }));
+    });
+    sock.on("open", () => {
+      sock.send(JSON.stringify({
+        cid: "ml_1",
+        match_list: {
+          min_size: 1,
+          max_size: 30,
+          authoritative: true
+        }
+      }));
+    });
+    sock.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.cid === "ml_1") {
+          if (msg.match_list && msg.match_list.matches) {
+            finish({ matches: msg.match_list.matches });
+          } else if (msg.error) {
+            finish({ error: msg.error.message || JSON.stringify(msg.error), matches: [] });
+          } else {
+            finish({ matches: [] });
+          }
+        }
+      } catch (_) {}
+    });
+    sock.on("error", (e) => finish({ error: e.message || "ws_error", matches: [] }));
+    sock.on("close", (code) => { if (!settled) finish({ error: `ws_closed_${code}`, matches: [] }); });
+  });
+}
+
+function fetchMatchJoin(token, matchId) {
+  return new Promise((resolve) => {
+    if (!WebSocket) return resolve({ error: "ws_not_installed", presences: [], match: null });
+    let settled = false, sock;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { sock && sock.close(); } catch (_) {}
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ error: "timeout", presences: [], match: null }), 12000);
+    try { sock = new WebSocket(nakamaWsUrl(token)); } catch (e) { return finish({ error: e.message }); }
+    const sid = "mj_" + crypto.randomBytes(4).toString("hex");
+    sock.on("unexpected-response", (req, res) => {
+      let body = "";
+      res.on("data", (c) => { body += c; });
+      res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, presences: [], match: null }));
+    });
+    sock.on("open", () => {
+      sock.send(JSON.stringify({
+        cid: sid,
+        match_join: { match_id: matchId }
+      }));
+    });
+    sock.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.cid === sid) {
+          if (msg.match) {
+            finish({ match: msg.match, presences: msg.match.presences || [] });
+          } else if (msg.error) {
+            finish({ error: msg.error.message || JSON.stringify(msg.error), presences: [], match: null });
+          }
+        }
+      } catch (_) {}
+    });
+    sock.on("error", (e) => finish({ error: e.message || "ws_error", presences: [], match: null }));
+    sock.on("close", (code) => { if (!settled) finish({ error: `ws_closed_${code}`, presences: [], match: null }); });
+  });
+}
+
 app.get("/api/room-lookup/:roomCode", async (req, res) => {
   const code = req.params.roomCode.trim();
-  if (!code) return res.json({ roomCode: code, playerCount: 0, players: [], scanned: 0, errors: [] });
-
-  const errors = [];
-  let totalFriends = 0;
-  let totalPresences = 0;
+  if (!code) return res.json({ roomCode: code, playerCount: 0, players: [], errors: [] });
 
   const activeSessions = Object.values(sessions).filter(s => s.token && !isExpired(s.token));
-  console.log(`[RoomLookup] Searching for room "${code}" — scanning ${activeSessions.length} session(s)...`);
+  if (!activeSessions.length) return res.json({ roomCode: code, playerCount: 0, players: [], errors: ["No active sessions with valid tokens"] });
 
-  // Collect ALL user IDs: friends from all sessions + anyone previously cached
-  const allUserIds = new Set(Object.keys(roomCache));
-  const friendsById = {};
+  const token = activeSessions[0].token;
+  const errors = [];
+  console.log(`[RoomLookup] Looking up room "${code}" via match_list...`);
 
-  for (const s of activeSessions) {
-    try {
-      const friends = await fetchAllFriends(s.token);
-      for (const f of friends) {
-        if (f.user && f.user.id) {
-          allUserIds.add(f.user.id);
-          friendsById[f.user.id] = f.user;
-        }
-      }
-      totalFriends += friends.length;
-      console.log(`[RoomLookup] Session ${s.name || s.id}: ${friends.length} friends`);
-    } catch (e) {
-      console.log(`[RoomLookup] Session ${s.name || s.id} fetch friends error: ${e.message}`);
-      errors.push(`${s.name || s.id}: ${e.message}`);
-    }
+  // Step 1: List all active matches
+  const listResult = await fetchMatchList(token);
+  if (listResult.error) {
+    console.log(`[RoomLookup] match_list error: ${listResult.error}`);
+    errors.push(`match_list: ${listResult.error}`);
   }
 
-  const userIdArray = [...allUserIds];
-  console.log(`[RoomLookup] Total unique user IDs to scan: ${userIdArray.length}`);
+  const matches = listResult.matches || [];
+  console.log(`[RoomLookup] Found ${matches.length} active match(es)`);
 
-  // Now do a single big WebSocket presence scan across ALL known users
-  if (userIdArray.length > 0) {
-    for (const s of activeSessions) {
-      try {
-        const presenceResult = await new Promise((resolve) => {
-          if (!WebSocket) return resolve({ error: "ws_not_installed", presences: [] });
+  // Step 2: Try to find the room by match label or by joining each match and checking presences' status
+  let players = [];
+  let foundMatch = false;
 
-          const BATCH_SIZE = 25;
-          const batches = [];
-          for (let i = 0; i < userIdArray.length; i += BATCH_SIZE) batches.push(userIdArray.slice(i, i + BATCH_SIZE));
+  // Strategy A: Check match labels for the room code
+  for (const m of matches) {
+    let labelStr = m.label || "";
+    if (labelStr === code) {
+      // Exact label match
+      foundMatch = true;
+      players = (m.presences || []).map(p => ({
+        userId: p.user_id || "",
+        name: p.username || p.user_id || "Unknown",
+        sessionId: p.session_id || "",
+        nodeId: p.node || "",
+        status: null
+      }));
+      console.log(`[RoomLookup] Found match by exact label: ${m.match_id} — ${players.length} player(s)`);
+      break;
+    }
+    try {
+      const labelObj = JSON.parse(labelStr);
+      if (labelObj.roomCode === code || labelObj.room_code === code || labelObj.room === code || labelObj.id === code) {
+        foundMatch = true;
+        players = (m.presences || []).map(p => ({
+          userId: p.user_id || "",
+          name: p.username || p.user_id || "Unknown",
+          sessionId: p.session_id || "",
+          nodeId: p.node || "",
+          status: null
+        }));
+        console.log(`[RoomLookup] Found match by label.${labelObj.roomCode ? 'roomCode' : 'room_code'}: ${m.match_id} — ${players.length} player(s)`);
+        break;
+      }
+    } catch (_) {}
+  }
 
-          let settled = false;
-          let sock;
-          const allPresences = [];
-          let batchIdx = 0;
-
-          const finish = (result) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            try { sock && sock.close(); } catch (_) {}
-            resolve(result);
-          };
-          const timeoutMs = Math.min(45000, 8000 + batches.length * 3000);
-          const timer = setTimeout(() => finish({ error: "timeout", presences: allPresences }), timeoutMs);
-
-          function sendNextBatch() {
-            if (batchIdx >= batches.length) return finish({ presences: allPresences });
-            try {
-              sock.send(JSON.stringify({ cid: "rl_" + batchIdx, status_follow: { user_ids: batches[batchIdx] } }));
-            } catch (e) { finish({ error: e.message, presences: allPresences }); }
-          }
-
-          try { sock = new WebSocket(nakamaWsUrl(s.token)); } catch (e) { return finish({ error: e.message }); }
-          sock.on("unexpected-response", (req, res) => {
-            let body = "";
-            res.on("data", (c) => { body += c; });
-            res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, presences: allPresences }));
-          });
-          sock.on("open", () => sendNextBatch());
-          sock.on("message", (raw) => {
-            try {
-              const msg = JSON.parse(raw.toString());
-              if (msg.cid && msg.cid.startsWith("rl_") && msg.status && msg.status.presences) {
-                allPresences.push(...msg.status.presences);
-                batchIdx++;
-                sendNextBatch();
-              }
-            } catch (_) {}
-          });
-          sock.on("error", (e) => finish({ error: e.message || "ws_error", presences: allPresences }));
-          sock.on("close", (c) => { if (!settled) finish({ error: `ws_closed_${c}`, presences: allPresences }); });
-        });
-
-        if (presenceResult.error) {
-          console.log(`[RoomLookup] Session ${s.name || s.id}: presence error: ${presenceResult.error}`);
-          errors.push(`${s.name || s.id}: ${presenceResult.error}`);
-        }
-
-        const presences = presenceResult.presences || [];
-        totalPresences += presences.length;
-
-        for (const p of presences) {
+  // Strategy B: If not found by label, join each match and check presences' user status for roomCode
+  if (!foundMatch && matches.length > 0) {
+    console.log(`[RoomLookup] No label match — joining ${matches.length} match(es) to check player statuses...`);
+    for (const m of matches) {
+      if (!m.match_id) continue;
+      const joinResult = await fetchMatchJoin(token, m.match_id);
+      if (joinResult.error) {
+        errors.push(`match_join ${m.match_id}: ${joinResult.error}`);
+        continue;
+      }
+      // Check if any presence's status contains the room code
+      const matchedPresences = (joinResult.presences || []).filter(p => {
+        try {
+          const st = JSON.parse(p.status || "{}");
+          return st.roomCode === code || st.room_code === code;
+        } catch (_) { return false; }
+      });
+      if (matchedPresences.length > 0) {
+        foundMatch = true;
+        players = (joinResult.presences || []).map(p => {
           let parsed = {};
           try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
-          if (!parsed.roomCode) continue;
-          const u = friendsById[p.user_id];
-          const name = (u && (u.display_name || u.username)) || roomCache[p.user_id]?.name || p.user_id;
-          roomCache[p.user_id] = {
-            roomCode: parsed.roomCode,
-            gameMode: parsed.gameMode,
-            lastSeenOnline: Date.now(),
-            name
+          return {
+            userId: p.user_id || "",
+            name: p.username || p.user_id || "Unknown",
+            sessionId: p.session_id || "",
+            nodeId: p.node || "",
+            roomCode: parsed.roomCode || parsed.room_code || null,
+            gameMode: parsed.gameMode ?? null,
+            status: parsed
           };
-        }
-        saveRoomCache();
-        console.log(`[RoomLookup] Session ${s.name || s.id}: ${presences.length} presences returned`);
-      } catch (e) {
-        console.log(`[RoomLookup] Session ${s.name || s.id} presence scan error: ${e.message}`);
-        errors.push(`${s.name || s.id}: ${e.message}`);
+        });
+        console.log(`[RoomLookup] Found room in match ${m.match_id} via status — ${players.length} player(s)`);
+        break;
       }
-      break; // one session's token is enough to follow all users
+      // Also check if match label contains the code after join
+      try {
+        const lbl = JSON.parse(joinResult.match?.label || "{}");
+        if (lbl.roomCode === code || lbl.room_code === code) {
+          foundMatch = true;
+          players = (joinResult.presences || []).map(p => {
+            let parsed = {};
+            try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
+            return {
+              userId: p.user_id || "",
+              name: p.username || p.user_id || "Unknown",
+              sessionId: p.session_id || "",
+              nodeId: p.node || "",
+              roomCode: parsed.roomCode || parsed.room_code || null,
+              gameMode: parsed.gameMode ?? null,
+              status: parsed
+            };
+          });
+          console.log(`[RoomLookup] Found room in match ${m.match_id} via post-join label — ${players.length} player(s)`);
+          break;
+        }
+      } catch (_) {}
     }
   }
 
-  const players = Object.entries(roomCache)
-    .filter(([, v]) => v.roomCode === code)
-    .map(([uid, v]) => ({
-      userId: uid,
-      name: v.name || uid,
-      gameMode: v.gameMode,
-      lastSeenOnline: v.lastSeenOnline
-    }));
+  // Strategy C: Still not found — check roomCache as fallback (from friend tracking)
+  if (!foundMatch) {
+    console.log(`[RoomLookup] No match found — falling back to roomCache (${Object.keys(roomCache).length} entries)`);
+    const cached = Object.entries(roomCache)
+      .filter(([, v]) => v.roomCode === code)
+      .map(([uid, v]) => ({
+        userId: uid,
+        name: v.name || uid,
+        gameMode: v.gameMode,
+        lastSeenOnline: v.lastSeenOnline,
+        source: "cache"
+      }));
+    if (cached.length) players = cached;
+  }
 
-  console.log(`[RoomLookup] Result for "${code}": ${players.length} player(s) found (${Object.keys(roomCache).length} total cached)`);
-  res.json({ roomCode: code, playerCount: players.length, players, scanned: totalFriends, presences: totalPresences, errors });
+  console.log(`[RoomLookup] Result for "${code}": ${players.length} player(s)`);
+  res.json({ roomCode: code, playerCount: players.length, players, matchCount: matches.length, errors });
 });
 
 app.post("/update-tokens",(req,res)=>{
@@ -1574,8 +1665,7 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
   <div class="rl-stats" id="stats" style="display:none">
     <div class="rl-stat"><div class="rl-stat-lbl">Room Code</div><div class="rl-stat-val" id="statCode">—</div></div>
     <div class="rl-stat"><div class="rl-stat-lbl">Players Found</div><div class="rl-stat-val" id="statCount">0</div></div>
-    <div class="rl-stat"><div class="rl-stat-lbl">Friends Scanned</div><div class="rl-stat-val" id="statScanned">0</div></div>
-    <div class="rl-stat"><div class="rl-stat-lbl">Presences</div><div class="rl-stat-val" id="statPresences">0</div></div>
+    <div class="rl-stat"><div class="rl-stat-lbl">Matches Scanned</div><div class="rl-stat-val" id="statMatches">0</div></div>
   </div>
 
   <div id="scanLog" style="display:none;margin-bottom:16px;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:12px;padding:12px 16px;font-family:var(--mono);font-size:10px;color:var(--muted);max-height:120px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></div>
@@ -1602,47 +1692,45 @@ async function lookupRoom(){
   const code=document.getElementById('roomInput').value.trim();
   if(!code){document.getElementById('roomInput').focus();return;}
   const btn=document.getElementById('searchBtn');
-  btn.textContent='Scanning all sessions...';btn.disabled=true;
+  btn.textContent='Scanning matches...';btn.disabled=true;
   const stats=document.getElementById('stats');
   const results=document.getElementById('results');
   const log=document.getElementById('scanLog');
-  results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="opacity:.5">Scanning all sessions and following friends via WebSocket...</div><div class="rl-empty-sub" style="opacity:.3">This may take a few seconds</div></div>';
+  results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="opacity:.5">Querying Nakama matches...</div><div class="rl-empty-sub" style="opacity:.3">Listing all active matches and checking for room '+code+'</div></div>';
   log.style.display='none';log.textContent='';
   try{
     const r=await fetch('/api/room-lookup/'+encodeURIComponent(code));
     const data=await r.json();
     document.getElementById('statCode').textContent=data.roomCode;
     document.getElementById('statCount').textContent=data.playerCount;
-    document.getElementById('statScanned').textContent=data.scanned||0;
-    document.getElementById('statPresences').textContent=data.presences||0;
+    document.getElementById('statMatches').textContent=data.matchCount||0;
     stats.style.display='flex';
     if(data.errors&&data.errors.length){
       log.style.display='block';
-      log.textContent='Scan details:\\n'+data.errors.join('\\n');
+      log.textContent='Scan details:\n'+data.errors.join('\n');
     }
     if(!data.players.length){
-      let reason='No players found in this room';
-      if(!data.scanned) reason+=' — 0 friends across all sessions, nothing to scan';
-      else if(!data.presences) reason+=' — '+data.scanned+' friends scanned but 0 returned presence (may be offline)';
-      else reason+=' — '+data.presences+' presences checked, none in room '+code;
-      results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">👤</div><div class="rl-empty-text">'+reason+'</div><div class="rl-empty-sub">This tool can only see friends of your tracked sessions. If the person you\\'re looking for isn\\'t a friend of any tracked session, they won\\'t appear here.</div></div>';
+      let reason='No players found in room '+code;
+      if(!data.matchCount) reason+=' — no active matches found on the server';
+      else reason+=' — scanned '+data.matchCount+' match(es), none contained this room code';
+      results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">👤</div><div class="rl-empty-text">'+reason+'</div><div class="rl-empty-sub">The room may be empty, the code may be wrong, or the game may not store room codes in match labels/statuses in a way this tool can detect.</div></div>';
     } else {
-      const sorted=[...data.players].sort((a,b)=>(b.lastSeenOnline||0)-(a.lastSeenOnline||0));
+      const sorted=[...data.players].sort((a,b)=>(a.name||'').localeCompare(b.name||''));
       results.innerHTML='<div class="rl-list">'+sorted.map(p=>{
         const initial=(p.name||'?')[0].toUpperCase();
-        const gmLabel=GM_LABELS[p.gameMode]||'Unknown';
-        const gmEmoji=GM_EMOJI[p.gameMode]||'🎮';
+        const gmLabel=GM_LABELS[p.gameMode]||'';
+        const gmEmoji=GM_EMOJI[p.gameMode]||'';
         const ago=p.lastSeenOnline?timeAgo(Date.now()-p.lastSeenOnline):'';
         return '<div class="rl-player">'
           +'<div class="rl-avatar">'+initial+'</div>'
           +'<div class="rl-info">'
             +'<div class="rl-name">'+(p.name||'Unknown').replace(/</g,'&lt;')+'</div>'
-            +'<div class="rl-uid">'+p.userId+'</div>'
+            +'<div class="rl-uid">'+p.userId+(p.sessionId?' · session: '+p.sessionId.slice(0,8)+'…':'')+'</div>'
           +'</div>'
           +'<div class="rl-meta">'
-            +'<span class="rl-badge rl-mode">'+gmEmoji+' '+gmLabel+'</span>'
+            +(gmLabel?'<span class="rl-badge rl-mode">'+gmEmoji+' '+gmLabel+'</span>':'')
             +(ago?'<span class="rl-badge rl-time">'+ago+'</span>':'')
-            +'<button class="rl-copy" onclick="copyText(\\''+p.userId+'\\')">Copy ID</button>'
+            +'<button class="rl-copy" onclick="copyText(\''+p.userId+'\')">Copy ID</button>'
           +'</div>'
         +'</div>';
       }).join('')+'</div>';
