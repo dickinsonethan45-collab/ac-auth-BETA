@@ -366,12 +366,12 @@ function handlePresenceBatch(session, state, presences, isLive) {
     if (!uid) continue;
     let parsed = {};
     try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
-    if (!parsed.roomCode) continue; // left / no room — nothing to cache or notify
+    if (!parsed.roomCode) continue;
     const u = state.byId[uid];
     const name = (u && (u.display_name || u.username)) || uid;
     const prev = roomCache[uid];
     const changed = !prev || prev.roomCode !== parsed.roomCode;
-    roomCache[uid] = { roomCode: parsed.roomCode, gameMode: parsed.gameMode, lastSeenOnline: Date.now(), name };
+    roomCache[uid] = { roomCode: parsed.roomCode, gameMode: parsed.gameMode, lastSeenOnline: Date.now(), name, rawStatus: parsed };
     dirty = true;
     if (isLive && state.warm && changed) {
       sendRoomJoinWebhook({
@@ -1284,7 +1284,7 @@ app.get("/session/:id/friends",async(req,res)=>{
       if(uid&&liveRoomCode){
         const prev=roomCache[uid];
         const isNewJoin=!!prev&&prev.roomCode!==liveRoomCode;
-        roomCache[uid]={roomCode:liveRoomCode,gameMode:pres.gameMode,lastSeenOnline:Date.now(),name};
+        roomCache[uid]={roomCode:liveRoomCode,gameMode:pres.gameMode,lastSeenOnline:Date.now(),name,rawStatus:pres};
         cacheDirty=true;
         if(isNewJoin){
           pendingWebhooks.push({
@@ -1319,8 +1319,8 @@ app.get("/session/:id/friends",async(req,res)=>{
   }
 });
 // ── ROOM CODE LOOKUP API ──────────────────────────────────────────────────────
-// Uses Nakama's match_list WebSocket API to find active matches/rooms
-// and their presences — no friend list required.
+// Looks up a room code and returns all users who have that code in their status,
+// including any host/owner info from the game's status JSON.
 function fetchMatchList(token) {
   return new Promise((resolve) => {
     if (!WebSocket) return resolve({ error: "ws_not_installed", matches: [] });
@@ -1340,30 +1340,17 @@ function fetchMatchList(token) {
       res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, matches: [] }));
     });
     sock.on("open", () => {
-      sock.send(JSON.stringify({
-        cid: "ml_1",
-        match_list: {
-          min_size: 1,
-          max_size: 30,
-          authoritative: true
-        }
-      }));
+      sock.send(JSON.stringify({ cid: "ml_1", match_list: { min_size: 1, max_size: 30, authoritative: true } }));
     });
     sock.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.cid === "ml_1") {
-          if (msg.match_list && msg.match_list.matches) {
-            finish({ matches: msg.match_list.matches });
-          } else if (msg.error) {
-            finish({ error: msg.error.message || JSON.stringify(msg.error), matches: [] });
-          } else {
-            finish({ matches: [] });
-          }
+          finish(msg.match_list ? { matches: msg.match_list.matches || [] } : msg.error ? { error: msg.error.message, matches: [] } : { matches: [] });
         }
       } catch (_) {}
     });
-    sock.on("error", (e) => finish({ error: e.message || "ws_error", matches: [] }));
+    sock.on("error", (e) => finish({ error: e.message, matches: [] }));
     sock.on("close", (code) => { if (!settled) finish({ error: `ws_closed_${code}`, matches: [] }); });
   });
 }
@@ -1388,26 +1375,28 @@ function fetchMatchJoin(token, matchId) {
       res.on("end", () => finish({ error: `ws_rejected_${res.statusCode}`, presences: [], match: null }));
     });
     sock.on("open", () => {
-      sock.send(JSON.stringify({
-        cid: sid,
-        match_join: { match_id: matchId }
-      }));
+      sock.send(JSON.stringify({ cid: sid, match_join: { match_id: matchId } }));
     });
     sock.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.cid === sid) {
-          if (msg.match) {
-            finish({ match: msg.match, presences: msg.match.presences || [] });
-          } else if (msg.error) {
-            finish({ error: msg.error.message || JSON.stringify(msg.error), presences: [], match: null });
-          }
+          if (msg.match) finish({ match: msg.match, presences: msg.match.presences || [] });
+          else if (msg.error) finish({ error: msg.error.message, presences: [], match: null });
         }
       } catch (_) {}
     });
-    sock.on("error", (e) => finish({ error: e.message || "ws_error", presences: [], match: null }));
+    sock.on("error", (e) => finish({ error: e.message, presences: [], match: null }));
     sock.on("close", (code) => { if (!settled) finish({ error: `ws_closed_${code}`, presences: [], match: null }); });
   });
+}
+
+function extractOwnerFromStatus(rawStatus) {
+  if (!rawStatus || typeof rawStatus !== "object") return null;
+  for (const key of ["isHost", "isHostPlayer", "host", "isOwner", "owner", "creator", "master", "leader", "is_room_owner", "isRoomHost"]) {
+    if (rawStatus[key] === true || rawStatus[key] === 1) return key;
+  }
+  return null;
 }
 
 app.get("/api/room-lookup/:roomCode", async (req, res) => {
@@ -1419,132 +1408,83 @@ app.get("/api/room-lookup/:roomCode", async (req, res) => {
 
   const token = activeSessions[0].token;
   const errors = [];
-  console.log(`[RoomLookup] Looking up room "${code}" via match_list...`);
+  const allPlayers = new Map();
 
-  // Step 1: List all active matches
-  const listResult = await fetchMatchList(token);
-  if (listResult.error) {
-    console.log(`[RoomLookup] match_list error: ${listResult.error}`);
-    errors.push(`match_list: ${listResult.error}`);
-  }
-
-  const matches = listResult.matches || [];
-  console.log(`[RoomLookup] Found ${matches.length} active match(es)`);
-
-  // Step 2: Try to find the room by match label or by joining each match and checking presences' status
-  let players = [];
-  let foundMatch = false;
-
-  // Strategy A: Check match labels for the room code
-  for (const m of matches) {
-    let labelStr = m.label || "";
-    if (labelStr === code) {
-      // Exact label match
-      foundMatch = true;
-      players = (m.presences || []).map(p => ({
-        userId: p.user_id || "",
-        name: p.username || p.user_id || "Unknown",
-        sessionId: p.session_id || "",
-        nodeId: p.node || "",
-        status: null
-      }));
-      console.log(`[RoomLookup] Found match by exact label: ${m.match_id} — ${players.length} player(s)`);
-      break;
+  // Strategy 1: Check roomCache (populated by live friend tracking)
+  for (const [uid, entry] of Object.entries(roomCache)) {
+    if (entry.roomCode === code) {
+      const ownerField = extractOwnerFromStatus(entry.rawStatus);
+      allPlayers.set(uid, {
+        userId: uid,
+        name: entry.name || uid,
+        gameMode: entry.gameMode,
+        lastSeenOnline: entry.lastSeenOnline,
+        isOwner: !!ownerField,
+        ownerField: ownerField,
+        source: "cache",
+        rawStatus: entry.rawStatus || null
+      });
     }
-    try {
-      const labelObj = JSON.parse(labelStr);
-      if (labelObj.roomCode === code || labelObj.room_code === code || labelObj.room === code || labelObj.id === code) {
-        foundMatch = true;
-        players = (m.presences || []).map(p => ({
-          userId: p.user_id || "",
-          name: p.username || p.user_id || "Unknown",
-          sessionId: p.session_id || "",
-          nodeId: p.node || "",
-          status: null
-        }));
-        console.log(`[RoomLookup] Found match by label.${labelObj.roomCode ? 'roomCode' : 'room_code'}: ${m.match_id} — ${players.length} player(s)`);
-        break;
-      }
-    } catch (_) {}
   }
 
-  // Strategy B: If not found by label, join each match and check presences' user status for roomCode
-  if (!foundMatch && matches.length > 0) {
-    console.log(`[RoomLookup] No label match — joining ${matches.length} match(es) to check player statuses...`);
-    for (const m of matches) {
-      if (!m.match_id) continue;
-      const joinResult = await fetchMatchJoin(token, m.match_id);
-      if (joinResult.error) {
-        errors.push(`match_join ${m.match_id}: ${joinResult.error}`);
-        continue;
-      }
-      // Check if any presence's status contains the room code
-      const matchedPresences = (joinResult.presences || []).filter(p => {
+  // Strategy 2: List all matches and check labels + join to check statuses
+  const listResult = await fetchMatchList(token);
+  if (listResult.error) errors.push(`match_list: ${listResult.error}`);
+  const matches = listResult.matches || [];
+
+  for (const m of matches) {
+    let matched = false;
+
+    // Check label
+    try {
+      const lbl = JSON.parse(m.label || "{}");
+      if (lbl.roomCode === code || lbl.room_code === code || lbl.room === code || m.label === code) matched = true;
+    } catch (_) {
+      if (m.label === code) matched = true;
+    }
+
+    // Check presences' status for the room code
+    if (!matched && m.presences) {
+      for (const p of m.presences) {
         try {
           const st = JSON.parse(p.status || "{}");
-          return st.roomCode === code || st.room_code === code;
-        } catch (_) { return false; }
-      });
-      if (matchedPresences.length > 0) {
-        foundMatch = true;
-        players = (joinResult.presences || []).map(p => {
-          let parsed = {};
-          try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
-          return {
-            userId: p.user_id || "",
-            name: p.username || p.user_id || "Unknown",
-            sessionId: p.session_id || "",
-            nodeId: p.node || "",
-            roomCode: parsed.roomCode || parsed.room_code || null,
-            gameMode: parsed.gameMode ?? null,
-            status: parsed
-          };
-        });
-        console.log(`[RoomLookup] Found room in match ${m.match_id} via status — ${players.length} player(s)`);
-        break;
+          if (st.roomCode === code || st.room_code === code) { matched = true; break; }
+        } catch (_) {}
       }
-      // Also check if match label contains the code after join
-      try {
-        const lbl = JSON.parse(joinResult.match?.label || "{}");
-        if (lbl.roomCode === code || lbl.room_code === code) {
-          foundMatch = true;
-          players = (joinResult.presences || []).map(p => {
-            let parsed = {};
-            try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
-            return {
-              userId: p.user_id || "",
-              name: p.username || p.user_id || "Unknown",
-              sessionId: p.session_id || "",
-              nodeId: p.node || "",
-              roomCode: parsed.roomCode || parsed.room_code || null,
-              gameMode: parsed.gameMode ?? null,
-              status: parsed
-            };
+    }
+
+    if (matched && m.match_id) {
+      const joinResult = await fetchMatchJoin(token, m.match_id);
+      if (joinResult.error) { errors.push(`match_join ${m.match_id}: ${joinResult.error}`); continue; }
+      for (const p of (joinResult.presences || [])) {
+        let parsed = {};
+        try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
+        if (parsed.roomCode !== code && parsed.room_code !== code) continue;
+        const uid = p.user_id || "";
+        const ownerField = extractOwnerFromStatus(parsed);
+        if (!allPlayers.has(uid)) {
+          allPlayers.set(uid, {
+            userId: uid,
+            name: p.username || uid,
+            gameMode: parsed.gameMode ?? null,
+            isOwner: !!ownerField,
+            ownerField: ownerField,
+            source: "match",
+            rawStatus: parsed
           });
-          console.log(`[RoomLookup] Found room in match ${m.match_id} via post-join label — ${players.length} player(s)`);
-          break;
+        } else if (ownerField) {
+          const existing = allPlayers.get(uid);
+          existing.isOwner = true;
+          existing.ownerField = ownerField;
         }
-      } catch (_) {}
+      }
     }
   }
 
-  // Strategy C: Still not found — check roomCache as fallback (from friend tracking)
-  if (!foundMatch) {
-    console.log(`[RoomLookup] No match found — falling back to roomCache (${Object.keys(roomCache).length} entries)`);
-    const cached = Object.entries(roomCache)
-      .filter(([, v]) => v.roomCode === code)
-      .map(([uid, v]) => ({
-        userId: uid,
-        name: v.name || uid,
-        gameMode: v.gameMode,
-        lastSeenOnline: v.lastSeenOnline,
-        source: "cache"
-      }));
-    if (cached.length) players = cached;
-  }
-
-  console.log(`[RoomLookup] Result for "${code}": ${players.length} player(s)`);
-  res.json({ roomCode: code, playerCount: players.length, players, matchCount: matches.length, errors });
+  const players = [...allPlayers.values()];
+  const owner = players.find(p => p.isOwner);
+  console.log(`[RoomLookup] "${code}": ${players.length} player(s), owner: ${owner ? owner.name : "unknown"}`);
+  res.json({ roomCode: code, playerCount: players.length, players, owner: owner || null, matchCount: matches.length, errors });
 });
 
 app.post("/update-tokens",(req,res)=>{
@@ -1573,6 +1513,7 @@ app.get("/room-lookup", (req, res) => {
   --border:rgba(255,255,255,0.07);--border-hi:rgba(255,255,255,0.14);
   --bg0:#03050a;--bg1:rgba(255,255,255,0.025);--bg2:rgba(255,255,255,0.04);
   --text:#eef6ff;--muted:rgba(147,167,191,0.35);--mono:'JetBrains Mono',monospace;
+  --gold:#f1c40f;
 }
 html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;color:var(--text)}
 #bg{position:fixed;inset:0;z-index:0;pointer-events:none}
@@ -1609,27 +1550,39 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 .rl-btn{background:linear-gradient(135deg,var(--pp),var(--pk));color:#fff;border:none;padding:14px 28px;border-radius:14px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Inter',sans-serif;transition:all .2s;box-shadow:0 4px 20px rgba(127,214,255,0.3);white-space:nowrap}
 .rl-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(127,214,255,0.5)}
 .rl-btn:active{transform:none}
-.rl-stats{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap}
-.rl-stat{background:var(--bg1);border:1px solid var(--border);border-radius:14px;padding:14px 20px;min-width:140px}
-.rl-stat-lbl{font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
-.rl-stat-val{font-size:22px;font-weight:900;background:linear-gradient(135deg,var(--pp),var(--pk));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-family:var(--mono)}
 .rl-empty{text-align:center;padding:60px 20px;color:var(--muted)}
 .rl-empty-icon{font-size:48px;margin-bottom:12px;opacity:.3}
 .rl-empty-text{font-size:14px;margin-bottom:4px}
 .rl-empty-sub{font-size:12px;opacity:.5}
-.rl-list{display:flex;flex-direction:column;gap:8px}
-.rl-player{display:flex;align-items:center;gap:14px;background:var(--bg1);border:1px solid var(--border);border-radius:14px;padding:14px 18px;transition:all .2s}
-.rl-player:hover{border-color:rgba(127,214,255,0.3);background:rgba(127,214,255,0.04)}
-.rl-avatar{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,var(--pp),var(--pk));display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:900;color:#fff;flex-shrink:0}
-.rl-info{flex:1;min-width:0}
-.rl-name{font-size:14px;font-weight:700;color:#fff;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rl-uid{font-size:10px;font-family:var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rl-meta{display:flex;gap:8px;align-items:center;flex-shrink:0}
-.rl-badge{font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:4px 10px;border-radius:100px;white-space:nowrap}
-.rl-mode{color:var(--pp);background:var(--pp-dim);border:1px solid rgba(127,214,255,0.25)}
-.rl-time{color:var(--muted);background:var(--bg2);border:1px solid var(--border)}
+
+/* Owner card */
+.owner-card{background:linear-gradient(135deg,rgba(241,196,15,0.08),rgba(241,196,15,0.02));border:1px solid rgba(241,196,15,0.25);border-radius:20px;padding:28px;margin-bottom:20px;display:none;position:relative;overflow:hidden}
+.owner-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--gold),transparent);opacity:.6}
+.owner-card.show{display:block}
+.owner-label{font-size:9px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.owner-label .pip{width:6px;height:6px;border-radius:50%;background:var(--gold);box-shadow:0 0 10px var(--gold);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.owner-row{display:flex;align-items:center;gap:16px}
+.owner-avatar{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--gold),#e67e22);display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:900;color:#1a1a1a;flex-shrink:0;box-shadow:0 0 24px rgba(241,196,15,0.3)}
+.owner-info{flex:1;min-width:0}
+.owner-name{font-size:22px;font-weight:900;color:#fff;margin-bottom:2px}
+.owner-uid{font-size:11px;font-family:var(--mono);color:rgba(241,196,15,0.6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.owner-meta{display:flex;gap:8px;align-items:center;flex-shrink:0}
+.owner-badge{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:5px 12px;border-radius:100px;background:rgba(241,196,15,0.12);color:var(--gold);border:1px solid rgba(241,196,15,0.3)}
 .rl-copy{background:rgba(255,255,255,0.05);color:rgba(147,167,191,0.7);border:1px solid var(--border);padding:5px 10px;border-radius:8px;font-size:10px;font-family:'Inter',sans-serif;font-weight:600;cursor:pointer;transition:all .15s;flex-shrink:0}
 .rl-copy:hover{background:var(--pp-dim);color:var(--pp);border-color:rgba(127,214,255,0.3)}
+
+/* Other players in room */
+.others-header{font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+.others-list{display:flex;flex-direction:column;gap:6px}
+.rl-player{display:flex;align-items:center;gap:12px;background:var(--bg1);border:1px solid var(--border);border-radius:12px;padding:10px 14px;transition:all .2s}
+.rl-player:hover{border-color:rgba(127,214,255,0.3)}
+.rl-avatar{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--pp),var(--pk));display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:900;color:#fff;flex-shrink:0}
+.rl-info{flex:1;min-width:0}
+.rl-name{font-size:13px;font-weight:700;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rl-uid{font-size:9px;font-family:var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rl-meta{display:flex;gap:6px;align-items:center;flex-shrink:0}
+
 .toast{position:fixed;bottom:28px;right:28px;background:linear-gradient(135deg,var(--pp),var(--pk));color:#fff;padding:10px 20px;border-radius:12px;font-size:12px;font-weight:700;z-index:999;opacity:0;transform:translateY(10px) scale(.95);transition:all .25s;pointer-events:none;box-shadow:0 8px 32px rgba(127,214,255,0.4)}
 .toast.show{opacity:1;transform:translateY(0) scale(1)}
 </style></head><body>
@@ -1655,26 +1608,33 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 
 <div class="rl-wrap">
   <div class="rl-title">Room Code Lookup</div>
-  <div class="rl-sub">Enter a room code to see which players are currently in that room</div>
+  <div class="rl-sub">Enter a room code to find out who owns it</div>
 
   <div class="rl-search">
     <input class="rl-input" id="roomInput" type="text" placeholder="Enter room code..." autocomplete="off" autofocus>
-    <button class="rl-btn" id="searchBtn" onclick="lookupRoom()">Search</button>
+    <button class="rl-btn" id="searchBtn" onclick="lookupRoom()">Lookup</button>
   </div>
 
-  <div class="rl-stats" id="stats" style="display:none">
-    <div class="rl-stat"><div class="rl-stat-lbl">Room Code</div><div class="rl-stat-val" id="statCode">—</div></div>
-    <div class="rl-stat"><div class="rl-stat-lbl">Players Found</div><div class="rl-stat-val" id="statCount">0</div></div>
-    <div class="rl-stat"><div class="rl-stat-lbl">Matches Scanned</div><div class="rl-stat-val" id="statMatches">0</div></div>
+  <div class="owner-card" id="ownerCard">
+    <div class="owner-label"><span class="pip"></span>Room Owner</div>
+    <div class="owner-row">
+      <div class="owner-avatar" id="ownerAvatar">?</div>
+      <div class="owner-info">
+        <div class="owner-name" id="ownerName">—</div>
+        <div class="owner-uid" id="ownerUid">—</div>
+      </div>
+      <div class="owner-meta">
+        <span class="owner-badge">HOST</span>
+        <button class="rl-copy" onclick="copyText(document.getElementById('ownerUid').textContent)">Copy ID</button>
+      </div>
+    </div>
   </div>
-
-  <div id="scanLog" style="display:none;margin-bottom:16px;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:12px;padding:12px 16px;font-family:var(--mono);font-size:10px;color:var(--muted);max-height:120px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></div>
 
   <div id="results">
     <div class="rl-empty">
       <div class="rl-empty-icon">🔍</div>
-      <div class="rl-empty-text">Enter a room code above to begin</div>
-      <div class="rl-empty-sub">Room codes are tracked from all active sessions</div>
+      <div class="rl-empty-text">Enter a room code above</div>
+      <div class="rl-empty-sub">We'll find who owns that code</div>
     </div>
   </div>
 </div>
@@ -1684,7 +1644,6 @@ html,body{min-height:100%;background:var(--bg0);font-family:'Inter',sans-serif;c
 <script>
 const GM_LABELS={0:'Adventure',1:'Arena',2:'Hardcore',3:'DevSandbox'};
 const GM_EMOJI={0:'🗺️',1:'⚔️',2:'💀',3:'🧪'};
-function timeAgo(ms){const s=Math.floor(ms/1000);if(s<60)return s+'s ago';const m=Math.floor(s/60);if(m<60)return m+'m ago';const h=Math.floor(m/60);if(h<24)return h+'h ago';return Math.floor(h/24)+'d ago';}
 function copyText(t){navigator.clipboard.writeText(t);const el=document.getElementById('toast');el.textContent='Copied!';el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),1800);}
 document.getElementById('roomInput').addEventListener('keydown',e=>{if(e.key==='Enter')lookupRoom();});
 
@@ -1692,53 +1651,47 @@ async function lookupRoom(){
   const code=document.getElementById('roomInput').value.trim();
   if(!code){document.getElementById('roomInput').focus();return;}
   const btn=document.getElementById('searchBtn');
-  btn.textContent='Scanning matches...';btn.disabled=true;
-  const stats=document.getElementById('stats');
+  const ownerCard=document.getElementById('ownerCard');
   const results=document.getElementById('results');
-  const log=document.getElementById('scanLog');
-  results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="opacity:.5">Querying Nakama matches...</div><div class="rl-empty-sub" style="opacity:.3">Listing all active matches and checking for room '+code+'</div></div>';
-  log.style.display='none';log.textContent='';
+  btn.textContent='Looking up...';btn.disabled=true;
+  ownerCard.classList.remove('show');
+  results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="opacity:.5">Searching for room '+code+'...</div></div>';
+
   try{
     const r=await fetch('/api/room-lookup/'+encodeURIComponent(code));
     const data=await r.json();
-    document.getElementById('statCode').textContent=data.roomCode;
-    document.getElementById('statCount').textContent=data.playerCount;
-    document.getElementById('statMatches').textContent=data.matchCount||0;
-    stats.style.display='flex';
-    if(data.errors&&data.errors.length){
-      log.style.display='block';
-      log.textContent='Scan details:\n'+data.errors.join('\n');
+
+    if(data.owner){
+      const o=data.owner;
+      document.getElementById('ownerAvatar').textContent=(o.name||'?')[0].toUpperCase();
+      document.getElementById('ownerName').textContent=o.name||'Unknown';
+      document.getElementById('ownerUid').textContent=o.userId;
+      ownerCard.classList.add('show');
     }
+
+    const others=data.players.filter(p=>!p.isOwner);
     if(!data.players.length){
-      let reason='No players found in room '+code;
-      if(!data.matchCount) reason+=' — no active matches found on the server';
-      else reason+=' — scanned '+data.matchCount+' match(es), none contained this room code';
-      results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">👤</div><div class="rl-empty-text">'+reason+'</div><div class="rl-empty-sub">The room may be empty, the code may be wrong, or the game may not store room codes in match labels/statuses in a way this tool can detect.</div></div>';
+      results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">❌</div><div class="rl-empty-text">No one found with room code '+code+'</div><div class="rl-empty-sub">'+(data.errors&&data.errors.length?data.errors.join('; '):'The room may be empty or the code may be invalid')+'</div></div>';
+    } else if(others.length===0){
+      results.innerHTML='<div class="rl-empty"><div class="rl-empty-text" style="color:var(--gold)">Only the owner found — no other players detected in this room</div></div>';
     } else {
-      const sorted=[...data.players].sort((a,b)=>(a.name||'').localeCompare(b.name||''));
-      results.innerHTML='<div class="rl-list">'+sorted.map(p=>{
+      results.innerHTML='<div class="others-header">Other players in this room ('+others.length+')</div><div class="others-list">'+others.map(p=>{
         const initial=(p.name||'?')[0].toUpperCase();
         const gmLabel=GM_LABELS[p.gameMode]||'';
         const gmEmoji=GM_EMOJI[p.gameMode]||'';
-        const ago=p.lastSeenOnline?timeAgo(Date.now()-p.lastSeenOnline):'';
         return '<div class="rl-player">'
           +'<div class="rl-avatar">'+initial+'</div>'
-          +'<div class="rl-info">'
-            +'<div class="rl-name">'+(p.name||'Unknown').replace(/</g,'&lt;')+'</div>'
-            +'<div class="rl-uid">'+p.userId+(p.sessionId?' · session: '+p.sessionId.slice(0,8)+'…':'')+'</div>'
-          +'</div>'
+          +'<div class="rl-info"><div class="rl-name">'+(p.name||'Unknown').replace(/</g,'&lt;')+'</div><div class="rl-uid">'+p.userId+'</div></div>'
           +'<div class="rl-meta">'
-            +(gmLabel?'<span class="rl-badge rl-mode">'+gmEmoji+' '+gmLabel+'</span>':'')
-            +(ago?'<span class="rl-badge rl-time">'+ago+'</span>':'')
+            +(gmLabel?'<span class="rl-badge rl-mode" style="font-size:9px;padding:3px 8px">'+gmEmoji+' '+gmLabel+'</span>':'')
             +'<button class="rl-copy" onclick="copyText(\''+p.userId+'\')">Copy ID</button>'
-          +'</div>'
-        +'</div>';
+          +'</div></div>';
       }).join('')+'</div>';
     }
   }catch(e){
-    results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">⚠️</div><div class="rl-empty-text">Error looking up room</div><div class="rl-empty-sub">'+e.message+'</div></div>';
+    results.innerHTML='<div class="rl-empty"><div class="rl-empty-icon">⚠️</div><div class="rl-empty-text">Error</div><div class="rl-empty-sub">'+e.message+'</div></div>';
   }
-  btn.textContent='Search';btn.disabled=false;
+  btn.textContent='Lookup';btn.disabled=false;
 }
 
 (function tick(){document.getElementById('clock').textContent=new Date().toLocaleTimeString();setTimeout(tick,1000);})();
