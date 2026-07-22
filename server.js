@@ -1319,9 +1319,50 @@ app.get("/session/:id/friends",async(req,res)=>{
   }
 });
 // ── ROOM CODE LOOKUP API ──────────────────────────────────────────────────────
-app.get("/api/room-lookup/:roomCode", (req, res) => {
+// Actively scans all sessions' friends + live presence before searching,
+// so the results are always fresh.
+let roomLookupScanning = false;
+app.get("/api/room-lookup/:roomCode", async (req, res) => {
   const code = req.params.roomCode.trim();
   if (!code) return res.json({ players: [] });
+
+  // Only scan if not already in progress (avoid hammering Nakama)
+  if (!roomLookupScanning) {
+    roomLookupScanning = true;
+    try {
+      const activeSessions = Object.values(sessions).filter(s => s.token && !isExpired(s.token));
+      for (const s of activeSessions) {
+        try {
+          const friends = await fetchAllFriends(s.token);
+          const userIds = friends.map(f => f.user && f.user.id).filter(Boolean);
+          const presenceResult = await fetchPresences(s.token, userIds);
+          if (presenceResult.presences) {
+            for (const p of presenceResult.presences) {
+              let parsed = {};
+              try { parsed = JSON.parse(p.status || "{}"); } catch (_) {}
+              if (!parsed.roomCode) continue;
+              const f = friends.find(fr => fr.user && fr.user.id === p.user_id);
+              const u = f && f.user;
+              const name = (u && (u.display_name || u.username)) || p.user_id;
+              roomCache[p.user_id] = {
+                roomCode: parsed.roomCode,
+                gameMode: parsed.gameMode,
+                lastSeenOnline: Date.now(),
+                name
+              };
+            }
+            saveRoomCache();
+            console.log(`[RoomLookup] Scanned session ${s.name || s.id}: ${presenceResult.presences.length} presences`);
+          }
+        } catch (e) {
+          console.log(`[RoomLookup] Error scanning session ${s.name || s.id}: ${e.message}`);
+        }
+      }
+    } finally {
+      roomLookupScanning = false;
+    }
+  }
+
   const players = Object.entries(roomCache)
     .filter(([, v]) => v.roomCode === code)
     .map(([uid, v]) => ({
